@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 
 struct PillOverlayView: View {
     @Bindable var appState: AppState
@@ -8,14 +7,20 @@ struct PillOverlayView: View {
     @State private var dotPulse = false
 
     var body: some View {
-        HStack(spacing: 7) {
-            recordingDot
-            waveOrSpinner
+        ZStack {
+            Capsule()
+                .fill(Color.clear)
+                .glassEffect(.clear.tint(.black.opacity(0.05)), in: .capsule)
+                .opacity(0.42)
+
+            HStack(spacing: 6) {
+                recordingDot
+                waveOrSpinner
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .modifier(GlassPillModifier())
-        // Entrance spring
+        .shadow(color: .black.opacity(0.03), radius: 4, y: 1)
         .scaleEffect(appeared ? 1 : 0.55)
         .opacity(appeared ? 1 : 0)
         .animation(.spring(response: 0.36, dampingFraction: 0.68), value: appeared)
@@ -39,17 +44,17 @@ struct PillOverlayView: View {
         return ZStack {
             Circle()
                 .fill(dotColor.opacity(0.25))
-                .frame(width: 14, height: 14)
+                .frame(width: 12, height: 12)
                 .scaleEffect(dotPulse ? 1.45 : 0.70)
                 .animation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true), value: dotPulse)
 
             Circle()
                 .fill(dotColor)
-                .frame(width: 6, height: 6)
+                .frame(width: 5, height: 5)
                 .scaleEffect(reactiveSz)
                 .animation(.spring(duration: 0.08, bounce: 0.1), value: loudness)
         }
-        .frame(width: 14, height: 14)
+        .frame(width: 12, height: 12)
         .animation(.easeInOut(duration: 0.3), value: appState.phase)
     }
 
@@ -80,55 +85,6 @@ struct PillOverlayView: View {
     }
 }
 
-// MARK: – Glass pill modifier
-
-/// Uses NSVisualEffectView (via NSViewRepresentable) for reliable desktop blur,
-/// plus glassEffect on macOS 26 for Liquid Glass treatment.
-/// TransparentHostingView.isOpaque == false enables the window server compositor.
-private struct GlassPillModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content
-                .background {
-                    VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
-                        .clipShape(Capsule())
-                }
-                .glassEffect(.regular, in: .capsule)
-        } else {
-            content
-                .background {
-                    VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
-                        .clipShape(Capsule())
-                }
-                .overlay(
-                    Capsule()
-                        .strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
-                )
-        }
-    }
-}
-
-// MARK: – NSVisualEffectView wrapper
-
-private struct VisualEffectBlur: NSViewRepresentable {
-    let material: NSVisualEffectView.Material
-    let blendingMode: NSVisualEffectView.BlendingMode
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material     = material
-        view.blendingMode = blendingMode
-        view.state        = .active
-        view.wantsLayer   = true
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material     = material
-        nsView.blendingMode = blendingMode
-    }
-}
-
 // MARK: – Processing wave (continuous sine sweep)
 
 /// 10 bars animated by a continuous sine wave that flows left→right.
@@ -137,9 +93,9 @@ private struct VisualEffectBlur: NSViewRepresentable {
 private struct ProcessingWave: View {
     private let barCount = 10
     private let barWidth: CGFloat = 2
-    private let barGap: CGFloat   = 3.6   // 10×2 + 9×3.6 = 52.4 ≈ AudioWaveView 54.5
-    private let maxH: CGFloat     = 22
-    private let minH: CGFloat     = 3
+    private let barGap: CGFloat   = 3.0
+    private let maxH: CGFloat     = 16
+    private let minH: CGFloat     = 2.5
 
     var body: some View {
         TimelineView(.animation) { timeline in
@@ -157,6 +113,6 @@ private struct ProcessingWave: View {
                 }
             }
         }
-        .frame(height: 26)
+        .frame(height: 18)
     }
 }

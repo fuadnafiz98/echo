@@ -4,13 +4,15 @@ import SwiftUI
 /// Shallow Gaussian envelope: centre bars tallest, edges ~30% height.
 /// Bars collapse to 1.5pt at silence (noise gate keeps levels at 0).
 
+/// 
+
 struct AudioWaveView: View {
     static let barCount = 16          // must match AppState.audioLevels.count
     let levels: [Float]               // caller guarantees count == barCount
 
     private let barWidth: CGFloat = 2
-    private let barGap: CGFloat   = 1.5
-    private let maxH: CGFloat     = 26
+    private let barGap: CGFloat   = 1.2
+    private let maxH: CGFloat     = 18
     private let minH: CGFloat     = 1.5
 
     var body: some View {

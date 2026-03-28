@@ -41,7 +41,7 @@ final class FloatingPanelController {
 
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: w, height: h),
-            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+            styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
@@ -50,20 +50,13 @@ final class FloatingPanelController {
         panel.level                = .floating
         panel.backgroundColor      = .clear
         panel.isOpaque             = false
-        panel.hasShadow            = true
+        panel.hasShadow            = false
         panel.hidesOnDeactivate    = false
         panel.collectionBehavior   = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = false
 
-        // Set content view FIRST, then configure layer —
-        // adding to the panel can reset layer properties.
         panel.contentView = hosting
-        hosting.frame     = panel.contentView!.bounds
-
-        // Now that the view is in the window hierarchy, force the layer transparent.
-        hosting.wantsLayer              = true
-        hosting.layer?.isOpaque         = false
-        hosting.layer?.backgroundColor  = CGColor.clear
+        hosting.frame = panel.contentView?.bounds ?? .zero
 
         positionPanel(panel)
 
@@ -109,7 +102,7 @@ final class FloatingPanelController {
         let sf = screen.visibleFrame
         let pw = panel.frame.size
         let x  = sf.origin.x + (sf.width  - pw.width)  / 2
-        let y  = sf.origin.y + 52
+        let y  = sf.origin.y + 20
 
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
