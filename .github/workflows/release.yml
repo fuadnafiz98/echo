@@ -1,0 +1,91 @@
+name: macOS
+
+env:
+  PROJECT_PATH: echo/echo.xcodeproj
+  SCHEME: echo
+  APP_NAME: Echo
+  APP_BUNDLE: echo.app
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Build app
+        run: |
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            build
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: macos-15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set version
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release app
+        run: |
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+          EXPORT_DIR="$RUNNER_TEMP/export"
+
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="${{ steps.version.outputs.value }}" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            build
+
+          mkdir -p "$EXPORT_DIR"
+          cp -R "$DERIVED_DATA/Build/Products/Release/$APP_BUNDLE" "$EXPORT_DIR/$APP_BUNDLE"
+
+      - name: Package artifacts
+        run: |
+          EXPORT_DIR="$RUNNER_TEMP/export"
+          mkdir -p dist
+
+          ditto -c -k --keepParent \
+            "$EXPORT_DIR/$APP_BUNDLE" \
+            "dist/$APP_NAME-${{ steps.version.outputs.value }}.app.zip"
+
+          chmod +x scripts/create-dmg.sh
+          scripts/create-dmg.sh \
+            "$EXPORT_DIR/$APP_BUNDLE" \
+            "dist/$APP_NAME-${{ steps.version.outputs.value }}.dmg"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.app.zip
+            dist/*.dmg
