@@ -1,0 +1,18 @@
+---
+description: Auto-load native macOS UI, Liquid Glass, and XcodeBuildMCP on every Echo change.
+globs: "**/*.{swift,metal}"
+alwaysApply: true
+---
+
+Read and follow these skills before writing or changing UI:
+
+- `.cursor/skills/macos-native-ui/SKILL.md`
+- `.cursor/skills/liquid-glass/SKILL.md`
+- `.cursor/skills/xcodebuildmcp/SKILL.md`
+
+Never recreate system controls. Never use the Xcode GUI.
+
+Build: xcodebuild -scheme echo -destination 'platform=macOS'
+Prefer XcodeBuildMCP tools.
+
+After any UI change: build → run → screenshot. If it looks like a web card, rewrite with Button / Toggle / TabView.

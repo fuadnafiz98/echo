@@ -1,0 +1,36 @@
+# Xcode
+.derivedData/
+**/.derivedData/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM/*.dSYM
+*.dSYM
+*.xcscmblueprint
+*.xcresult
+
+# User settings
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+
+# Package Manager
+# CocoaPods
+# Pods/
+# Carthage
+# Carthage/Build/
+# SwiftPM
+.build/
+SourcePackages/checkouts/
+
+# SwiftLint
+.swiftlint.yml
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# macOS
+.DS_Store

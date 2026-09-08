@@ -1,0 +1,17 @@
+schemaVersion: 1
+enabledWorkflows:
+  - macos
+  - project-discovery
+  - session-management
+  - utilities
+  - ui-automation
+incrementalBuildsEnabled: true
+sessionDefaults:
+  projectPath: echo/echo.xcodeproj
+  scheme: echo
+  configuration: Debug
+  arch: arm64
+  bundleId: com.fuadnafiz98.echo
+setupPreferences:
+  platforms:
+    - macOS
