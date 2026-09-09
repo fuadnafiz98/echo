@@ -50,6 +50,14 @@ struct HotPathInvariantTests {
         let deliver = try #require(AppSource.method(source, named: "deliver"))
         #expect(deliver.contains("UsageStats.recordSuccessfulPaste"))
         #expect(deliver.contains("UsageWords.count"))
+        #expect(
+            AppSource.appearsInOrder(deliver, [
+                "DictationCleanup.apply",
+                "PasteService.paste",
+                "UsageStats.recordSuccessfulPaste",
+            ]),
+            "deliver must cleanup, then paste, then record. Got:\n\(deliver)"
+        )
         #expect(!deliver.contains("flushPending"))
         #expect(!deliver.contains("UsageStatsStore"))
         #expect(!deliver.contains("ResourceStats"))

@@ -11,5 +11,5 @@
 /// - `com.apple.security.files.bookmarks.app-scope` for model downloads and Application Support
 ///
 /// Accessibility TCC and `CGEvent` ⌘V paste would need a different MAS strategy
-/// (likely clipboard-only). Screen Recording is TCC, not an entitlement.
+/// (likely clipboard-only).
 enum DistributionNotes {}

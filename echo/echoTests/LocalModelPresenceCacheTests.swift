@@ -17,7 +17,7 @@ struct LocalModelPresenceCacheTests {
         )
 
         #expect(LocalModelPresence.isReady(.s1Mini))
-        let took = HotPathBudget.elapsed {
+        let took = HotPathBudget.elapsed("isReady after set 5k") {
             for _ in 0..<HotPathBudget.presenceLookupCount {
                 precondition(LocalModelPresence.isReady(.s1Mini))
             }
@@ -39,7 +39,7 @@ struct LocalModelPresenceCacheTests {
         LocalModelPresence.rebuild(.s1Mini, modelsRoot: root)
         #expect(LocalModelPresence.isReady(.s1Mini))
 
-        let took = HotPathBudget.elapsed {
+        let took = HotPathBudget.elapsed("isReady after rebuild 5k") {
             for _ in 0..<HotPathBudget.presenceLookupCount {
                 precondition(LocalModelPresence.isReady(.s1Mini))
             }

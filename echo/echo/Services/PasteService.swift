@@ -77,10 +77,6 @@ enum PasteService {
         openPrivacySettings(legacyAnchor: "Privacy_Accessibility")
     }
 
-    static func openScreenRecordingSettings() {
-        openPrivacySettings(legacyAnchor: "Privacy_ScreenCapture")
-    }
-
     private static func openPrivacySettings(legacyAnchor: String) {
         let candidates = [
             "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(legacyAnchor)",

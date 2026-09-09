@@ -13,6 +13,8 @@ struct AppChromeSettingsTests {
         #expect(!settings.contains("UsageSettingsSection"))
         #expect(!settings.contains("LabeledContent(\"CPU\")"))
         #expect(!settings.contains("LabeledContent(\"Words spoken\")"))
+        #expect(!settings.contains("Screen Recording"))
+        #expect(!settings.contains("BackdropSampler"))
     }
 
     @Test func menuBarExtraUsesIsInsertedBinding() throws {
@@ -30,5 +32,24 @@ struct AppChromeSettingsTests {
         #expect(source.contains("var showMenuBar: Bool?"))
         #expect(source.contains("var showInDock: Bool?"))
         #expect(source.contains("var restoreClipboard: Bool?"))
+    }
+
+    @Test func frontmostContextUsesWorkspaceNotScreenPixels() throws {
+        let source = try AppSource.load("Services/Dictation/FrontmostContext.swift")
+        #expect(source.contains("NSWorkspace.shared.frontmostApplication"))
+        #expect(source.contains("AXUIElementCopyAttributeValue"))
+        #expect(!source.contains("ScreenCaptureKit"))
+        #expect(!source.contains("SCShareableContent"))
+        #expect(!source.contains("CGWindowListCreateImage"))
+    }
+
+    @Test func overlayDoesNotOpenACaptureSession() throws {
+        let panel = try AppSource.load("Windows/FloatingPanelController.swift")
+        let coordinator = try AppSource.load("EchoCoordinator.swift")
+        #expect(!panel.contains("BackdropSampler"))
+        #expect(!panel.contains("ScreenCaptureKit"))
+        #expect(!panel.contains("startBackdropSampling"))
+        #expect(!coordinator.contains("BackdropSampler"))
+        #expect(!coordinator.contains("ScreenCaptureKit"))
     }
 }

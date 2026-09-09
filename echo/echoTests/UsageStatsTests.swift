@@ -16,60 +16,23 @@ struct UsageStatsTests {
         let (store, folder, calendar, now) = try makeTempStore(day: (2026, 9, 8))
         defer { try? FileManager.default.removeItem(at: folder) }
 
-        await store.add(words: 12, takes: 1, now: now, calendar: calendar)
-        await store.add(words: 8, takes: 1, now: now, calendar: calendar)
+        await store.add(words: 12, takes: 1, speechToTextMilliseconds: 400, now: now, calendar: calendar)
+        await store.add(words: 8, takes: 1, speechToTextMilliseconds: 600, now: now, calendar: calendar)
 
-        let todaySnap = await store.snapshot(now: now, calendar: calendar)
-        #expect(todaySnap.totalWords == 20)
-        #expect(todaySnap.totalTakes == 2)
-        #expect(todaySnap.days.count == 1)
-        #expect(todaySnap.totals(for: .today, now: now, calendar: calendar).words == 20)
+        let takes = await store.allTakes(now: now, calendar: calendar)
+        #expect(UsageStatsAggregator.totals(in: takes) == (20, 2))
+        let snap = await store.snapshot(for: .days15, now: now, calendar: calendar)
+        #expect(snap.totalWords == 20)
+        #expect(snap.totalTakes == 2)
+        #expect(snap.averageSpeechToTextMilliseconds == 500)
 
         let reloaded = UsageStatsStore(fileURL: folder.appendingPathComponent("stats.json"))
-        let again = await reloaded.snapshot(now: now, calendar: calendar)
-        #expect(again.totalWords == 20)
-        #expect(again.totalTakes == 2)
+        let again = await reloaded.allTakes(now: now, calendar: calendar)
+        #expect(UsageStatsAggregator.totals(in: again) == (20, 2))
+        #expect(again.compactMap(\.ms) == [400, 600])
     }
 
-    @Test func rangeTotalsIgnoreOlderDays() async throws {
-        let (store, folder, calendar, now) = try makeTempStore(day: (2026, 9, 8))
-        defer { try? FileManager.default.removeItem(at: folder) }
-
-        await store.add(words: 5, takes: 1, now: now, calendar: calendar)
-        await store.add(
-            words: 7,
-            takes: 1,
-            now: shift(now, days: -3, calendar: calendar),
-            calendar: calendar
-        )
-        await store.add(
-            words: 11,
-            takes: 2,
-            now: shift(now, days: -10, calendar: calendar),
-            calendar: calendar
-        )
-        await store.add(
-            words: 13,
-            takes: 1,
-            now: shift(now, days: -40, calendar: calendar),
-            calendar: calendar
-        )
-        await store.add(
-            words: 17,
-            takes: 1,
-            now: shift(now, days: -100, calendar: calendar),
-            calendar: calendar
-        )
-
-        let snap = await store.snapshot(now: now, calendar: calendar)
-        #expect(snap.totals(for: .today, now: now, calendar: calendar) == (5, 1))
-        #expect(snap.totals(for: .last7, now: now, calendar: calendar) == (12, 2))
-        #expect(snap.totals(for: .last30, now: now, calendar: calendar) == (23, 4))
-        #expect(snap.totals(for: .last90, now: now, calendar: calendar) == (36, 5))
-        #expect(snap.totals(for: .all, now: now, calendar: calendar) == (53, 6))
-    }
-
-    @Test func pruneDropsDaysOlderThanRetention() async throws {
+    @Test func pruneDropsTakesOlderThanRetention() async throws {
         let (store, folder, calendar, now) = try makeTempStore(day: (2026, 9, 8))
         defer { try? FileManager.default.removeItem(at: folder) }
 
@@ -87,36 +50,11 @@ struct UsageStatsTests {
         )
         await store.add(words: 4, takes: 1, now: now, calendar: calendar)
 
-        let snap = await store.snapshot(now: now, calendar: calendar)
-        #expect(snap.totalWords == 7)
-        #expect(snap.days.contains(where: { $0.wordCount == 9 }) == false)
-        #expect(snap.days.contains(where: { $0.wordCount == 3 }))
-    }
-
-    @Test func chartDaysZeroFillsMissingDays() async throws {
-        let (store, folder, calendar, now) = try makeTempStore(day: (2026, 9, 8))
-        defer { try? FileManager.default.removeItem(at: folder) }
-
-        await store.add(words: 10, takes: 2, now: now, calendar: calendar)
-        await store.add(
-            words: 4,
-            takes: 1,
-            now: shift(now, days: -2, calendar: calendar),
-            calendar: calendar
-        )
-
-        let snap = await store.snapshot(now: now, calendar: calendar)
-        let week = snap.chartDays(for: .last7, now: now, calendar: calendar)
-        #expect(week.count == 7)
-        #expect(week.last?.words == 10)
-        #expect(week.last?.takes == 2)
-        #expect(week[week.count - 3].words == 4)
-        #expect(week[week.count - 2].words == 0)
-        #expect(week[0].words == 0)
-
-        let today = snap.chartDays(for: .today, now: now, calendar: calendar)
-        #expect(today.count == 1)
-        #expect(today[0].words == 10)
+        let takes = await store.allTakes(now: now, calendar: calendar)
+        let totals = UsageStatsAggregator.totals(in: takes)
+        #expect(totals.words == 7)
+        #expect(takes.contains(where: { $0.words == 9 }) == false)
+        #expect(takes.contains(where: { $0.words == 3 }))
     }
 
     @Test func defaultFileURLLivesUnderEchoApplicationSupport() {

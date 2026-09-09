@@ -41,10 +41,14 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
         cacheLock.lock()
         let warm = warmTask
         warmTask = nil
+        let managerToClean: AsrManager?
         let cancelled: [Task<CachedManager, Error>]
         if let variant {
             if cached?.variant == variant.rawValue {
+                managerToClean = cached?.manager
                 cached = nil
+            } else {
+                managerToClean = nil
             }
             var remaining: [String: InflightLoad] = [:]
             var toCancel: [Task<CachedManager, Error>] = []
@@ -59,6 +63,7 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
             cancelled = toCancel
         } else {
             cancelled = inflight.values.map(\.task)
+            managerToClean = cached?.manager
             cached = nil
             inflight.removeAll()
         }
@@ -66,6 +71,11 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
         warm?.cancel()
         for task in cancelled {
             task.cancel()
+        }
+        if let managerToClean {
+            Task {
+                await managerToClean.cleanup()
+            }
         }
     }
 
@@ -94,11 +104,13 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
             partialContinuation = nil
         }
 
-        guard !samples.isEmpty else { return "" }
+        let audio = samples
+        samples = []
+        guard !audio.isEmpty else { return "" }
 
         let loaded = try await Self.loadCached(variant: variant, folder: try Self.requiredFolder(variant))
         var decoderState = TdtDecoderState.make(decoderLayers: loaded.decoderLayers)
-        let result = try await loaded.manager.transcribe(samples, decoderState: &decoderState)
+        let result = try await loaded.manager.transcribe(audio, decoderState: &decoderState)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty {
             partialContinuation?.yield(text)
@@ -166,12 +178,19 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
                 cacheLock.unlock()
                 return loaded
             }
+            let previous = cached
             cached = loaded
             inflight[key] = nil
             if warmTask == nil {
                 warmTask = makeWarmTask(loaded)
             }
+            let stale = previous.flatMap { old in
+                old.variant == variant.rawValue && old.folderPath == path ? nil : old.manager
+            }
             cacheLock.unlock()
+            if let stale {
+                Task { await stale.cleanup() }
+            }
             return loaded
         } catch {
             cacheLock.lock()

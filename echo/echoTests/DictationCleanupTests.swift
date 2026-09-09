@@ -52,20 +52,20 @@ struct DictationCleanupTests {
     @Test func spokenFormsAndReplacementsStayMillisecondCheap() {
         let terms = ["aim2-core", "echo.app", "python.py", "s1-mini", "whisperkit"]
         _ = terms.flatMap { SpokenForms.expansions(for: $0) }
-        let formsTook = HotPathBudget.elapsed {
+        let formsTook = HotPathBudget.elapsed("SpokenForms.expansions warm") {
             _ = terms.flatMap { SpokenForms.expansions(for: $0) }
         }
         #expect(formsTook < HotPathBudget.paragraph, "SpokenForms.expansions took \(formsTook) (budget \(HotPathBudget.paragraph))")
 
         _ = ReplacementEngine.apply(paragraph, replacements: userReplacements)
-        let replaceTook = HotPathBudget.elapsed {
+        let replaceTook = HotPathBudget.elapsed("ReplacementEngine.apply warm") {
             _ = ReplacementEngine.apply(paragraph, replacements: userReplacements)
         }
         #expect(replaceTook < HotPathBudget.paragraph, "ReplacementEngine.apply took \(replaceTook) (budget \(HotPathBudget.paragraph))")
     }
 
     @Test func localCleanupStaysMillisecondCheap() {
-        let first = HotPathBudget.elapsed {
+        let first = HotPathBudget.elapsed("DictationCleanup.apply first") {
             _ = DictationCleanup.apply(
                 paragraph,
                 stripFillers: true,
@@ -76,7 +76,7 @@ struct DictationCleanupTests {
         }
         #expect(first < HotPathBudget.cleanupFirstCall, "DictationCleanup.apply first call took \(first) (budget \(HotPathBudget.cleanupFirstCall))")
 
-        let warmed = HotPathBudget.elapsed {
+        let warmed = HotPathBudget.elapsed("DictationCleanup.apply warm") {
             _ = DictationCleanup.apply(
                 paragraph,
                 stripFillers: true,

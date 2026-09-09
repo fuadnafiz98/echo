@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ResourcesSettingsPane: View {
     @State private var window: ResourceHistoryWindow = .live15
-    @State private var latest: ResourceChartPoint?
+    @State private var latest: ResourceSample?
     @State private var live: [ResourceChartPoint] = []
     @State private var historical: [ResourceChartPoint] = []
     @State private var gpuSource: GPUMetrics.Source?
@@ -15,17 +15,44 @@ struct ResourcesSettingsPane: View {
 
         Form {
             Section {
-                LabeledContent("CPU") {
-                    Text(cpuLabel)
+                LabeledContent {
+                    Text(processCPULabel)
+                        .monospacedDigit()
+                } label: {
+                    Text("CPU")
+                    Text("This process · 100% = one core")
+                }
+                LabeledContent {
+                    Text(systemCPULabel)
+                        .monospacedDigit()
+                } label: {
+                    Text("This Mac")
+                    Text("All cores · host load")
                 }
                 LabeledContent {
                     Text(memoryLabel)
+                        .monospacedDigit()
                 } label: {
                     Text("Memory")
-                    Text(residentCaption)
+                    Text(memoryCaption)
+                }
+                LabeledContent {
+                    Text(residentLabel)
+                        .monospacedDigit()
+                } label: {
+                    Text("Resident")
+                    Text("RSS · pages still mapped")
+                }
+                LabeledContent {
+                    Text(neuralLabel)
+                        .monospacedDigit()
+                } label: {
+                    Text("Neural Engine")
+                    Text(neuralCaption)
                 }
                 LabeledContent {
                     Text(gpuLabel)
+                        .monospacedDigit()
                 } label: {
                     Text(gpuTitle)
                     Text(gpuSubtitle)
@@ -45,7 +72,7 @@ struct ResourcesSettingsPane: View {
 
             ResourceMetricSection(
                 title: "CPU",
-                unit: "%",
+                unit: "% of one core",
                 emptyTitle: "Waiting for CPU samples",
                 points: points,
                 value: { $0.cpuPercent },
@@ -56,12 +83,23 @@ struct ResourcesSettingsPane: View {
 
             ResourceMetricSection(
                 title: "Memory",
-                unit: "MB",
+                unit: "MB footprint",
                 emptyTitle: "Waiting for memory samples",
                 points: points,
                 value: { $0.memoryMegabytes },
                 format: Self.memoryAxisLabel,
                 yDomain: memoryDomain(points),
+                xFormat: window.axisFormat
+            )
+
+            ResourceMetricSection(
+                title: "Neural Engine",
+                unit: "MB reclaimable",
+                emptyTitle: "No ANE samples yet",
+                points: points,
+                value: { $0.neuralMegabytes },
+                format: Self.memoryAxisLabel,
+                yDomain: neuralDomain(points),
                 xFormat: window.axisFormat
             )
 
@@ -93,23 +131,41 @@ struct ResourcesSettingsPane: View {
         }
     }
 
-    private var cpuLabel: String {
-        guard let latest else { return "—" }
-        return Self.percentLabel(latest.cpuPercent)
+    private var processCPULabel: String {
+        guard let value = latest?.processCPUPercent else { return "—" }
+        return Self.percentLabel(value)
+    }
+
+    private var systemCPULabel: String {
+        guard let value = latest?.systemCPUPercent else { return "—" }
+        return Self.percentLabel(value)
     }
 
     private var memoryLabel: String {
         guard let latest else { return "—" }
-        return ByteCountFormatter.string(fromByteCount: Int64(clamping: latest.memoryBytes), countStyle: .memory)
+        return Self.bytesLabel(latest.footprintBytes)
     }
 
-    private var residentCaption: String {
-        guard let latest else { return "Footprint" }
-        let resident = ByteCountFormatter.string(
-            fromByteCount: Int64(clamping: latest.residentBytes),
-            countStyle: .memory
-        )
-        return "Footprint · resident \(resident)"
+    private var memoryCaption: String {
+        guard let latest else { return "phys_footprint · Activity Monitor Memory" }
+        if latest.neuralInFootprintBytes > 0 {
+            return "phys_footprint · includes \(Self.bytesLabel(latest.neuralInFootprintBytes)) ANE in footprint"
+        }
+        return "phys_footprint · Activity Monitor Memory"
+    }
+
+    private var residentLabel: String {
+        guard let latest else { return "—" }
+        return Self.bytesLabel(latest.residentBytes)
+    }
+
+    private var neuralLabel: String {
+        guard let latest else { return "—" }
+        return Self.bytesLabel(latest.neuralReclaimableBytes)
+    }
+
+    private var neuralCaption: String {
+        "Reclaimable ANE · not in Memory above"
     }
 
     private var gpuLabel: String {
@@ -120,41 +176,58 @@ struct ResourcesSettingsPane: View {
     private var gpuTitle: String {
         switch gpuSource {
         case .process, nil: "GPU"
-        case .system: "System GPU"
+        case .system: "This Mac GPU"
         }
     }
 
     private var gpuSubtitle: String {
+        let metal: String
+        if let bytes = latest?.metalAllocatedBytes {
+            metal = "Metal allocated \(Self.bytesLabel(bytes))"
+        } else {
+            metal = "Metal allocated —"
+        }
         switch gpuSource {
-        case .process: "This process"
-        case .system: "This Mac, not Echo alone"
-        case nil: "Not available"
+        case .process:
+            return "This process Metal/AGX time · \(metal)"
+        case .system:
+            return "This Mac, not Echo alone · \(metal)"
+        case nil:
+            return "No GPU time yet · \(metal)"
         }
     }
 
     private var gpuChartTitle: String {
         switch gpuSource {
         case .process: "GPU"
-        case .system: "System GPU"
+        case .system: "This Mac GPU"
         case nil: "GPU"
         }
     }
 
     private var gpuEmptyTitle: String {
-        "GPU utilization isn’t available"
+        "GPU time isn’t available"
     }
 
     private var resourcesFooter: String {
         let gpu: String
         switch gpuSource {
         case .process:
-            gpu = "GPU is Echo’s Metal/AGX time for this process."
+            gpu = "GPU % is Echo’s Metal/AGX time for this process."
         case .system:
-            gpu = "GPU is this Mac’s GPU (IOAccelerator device utilization), not Echo alone."
+            gpu = "GPU % is this Mac’s GPU (IOAccelerator), not Echo alone."
         case nil:
-            gpu = "No GPU figure is available — Echo does not show 0 when a sample is missing."
+            gpu = "No GPU time is available — Echo does not show 0 when a sample is missing."
         }
-        return "\(gpu) CPU and memory are this process. Charts update once a second while this tab is open. Echo stores one point per minute for about 90 days."
+        return """
+        CPU is this process: 100% means Echo fully used one logical CPU for the last second. \
+        This Mac is host load across all cores. \
+        Memory is phys_footprint (Activity Monitor Memory). Resident is RSS. \
+        Neural Engine is reclaimable ANE — Parakeet can hold hundreds of MB here that Memory does not include. \
+        \(gpu) \
+        Charts update once a second while this tab is open. Sampling stops when you leave. \
+        Echo stores at most one point per minute from those samples, for about 90 days.
+        """
     }
 
     private func cpuDomain(_ points: [ResourceChartPoint]) -> ClosedRange<Double> {
@@ -167,6 +240,11 @@ struct ResourcesSettingsPane: View {
         return 0...max(8, peak * 1.15)
     }
 
+    private func neuralDomain(_ points: [ResourceChartPoint]) -> ClosedRange<Double> {
+        let peak = points.map(\.neuralMegabytes).max() ?? 0
+        return 0...max(8, peak * 1.15)
+    }
+
     private static func percentLabel(_ value: Double) -> String {
         "\(value.formatted(.number.precision(.fractionLength(0...1))))%"
     }
@@ -175,65 +253,45 @@ struct ResourcesSettingsPane: View {
         "\(value.formatted(.number.precision(.fractionLength(0...1)))) MB"
     }
 
+    private static func bytesLabel(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .memory)
+    }
+
     private func appear() {
         loadHistory()
         sampleTask?.cancel()
         sampleTask = Task.detached(priority: .utility) {
-            var previousMetrics: ProcessMetrics.Raw?
-            var previousGPUTimeNS: UInt64?
-            var previousWallNS: UInt64?
+            var sampler = ResourceSampler()
             while !Task.isCancelled {
-                let now = Date.now
-                let raw = ProcessMetrics.read()
-                let gpuRaw = GPUMetrics.readRaw()
-                var cpu = 0.0
-                var memory: UInt64 = 0
-                var resident: UInt64 = 0
-                let hadPrevious = previousMetrics != nil
-                if let raw {
-                    if let previousMetrics {
-                        cpu = ProcessMetrics.cpuPercent(from: previousMetrics, to: raw)
+                let sample = sampler.tick()
+                let persist = sample.flatMap { sampler.persistIfDue($0) }
+                if let sample {
+                    await MainActor.run {
+                        applyLive(sample)
                     }
-                    memory = raw.footprintBytes > 0 ? raw.footprintBytes : raw.residentBytes
-                    resident = raw.residentBytes
-                    previousMetrics = raw
                 }
-                let wallNS = ProcessMetrics.nanoseconds(fromMachTicks: mach_absolute_time())
-                let reading = ResourceStats.reading(
-                    gpuRaw: gpuRaw,
-                    previousGPUTimeNS: previousGPUTimeNS,
-                    previousWallNS: previousWallNS,
-                    wallNS: wallNS
-                )
-                previousGPUTimeNS = gpuRaw.processGPUTimeNS
-                previousWallNS = wallNS
-                guard hadPrevious else {
-                    try? await Task.sleep(for: .seconds(1))
-                    continue
-                }
-
-                let point = ResourceChartPoint(
-                    date: now,
-                    cpuPercent: cpu,
-                    memoryBytes: memory,
-                    residentBytes: resident,
-                    gpuPercent: reading?.percent,
-                    gpuSource: reading?.source
-                )
-                await MainActor.run {
-                    latest = point
-                    gpuSource = reading?.source ?? gpuSource
-                    var next = live
-                    next.append(point)
-                    let cutoff = now.addingTimeInterval(-ResourceHistoryWindow.live15.duration)
-                    if next.count > 960 || next.first?.date ?? now < cutoff {
-                        next.removeAll { $0.date < cutoff }
-                    }
-                    live = next
+                if let persist {
+                    await ResourceStatsStore.shared.upsert(persist)
                 }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    @MainActor
+    private func applyLive(_ sample: ResourceSample) {
+        latest = sample
+        if let source = sample.gpuSource {
+            gpuSource = source
+        }
+        guard let point = sample.chartPoint() else { return }
+        var next = live
+        next.append(point)
+        let cutoff = sample.date.addingTimeInterval(-ResourceHistoryWindow.live15.duration)
+        if next.count > 960 || next.first?.date ?? sample.date < cutoff {
+            next.removeAll { $0.date < cutoff }
+        }
+        live = next
     }
 
     private func disappear() {
@@ -276,7 +334,7 @@ private struct ResourceMetricSection: View {
                 ContentUnavailableView(
                     emptyTitle,
                     systemImage: "chart.xyaxis.line",
-                    description: Text("Samples appear while Resources is open, and once a minute while Echo is running.")
+                    description: Text("Samples appear while this tab is open. Echo stores at most one point per minute from those samples.")
                 )
                 .frame(minHeight: 140)
             } else {

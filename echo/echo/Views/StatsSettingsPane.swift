@@ -2,29 +2,28 @@ import Charts
 import SwiftUI
 
 struct StatsSettingsPane: View {
-    @State private var snapshot = UsageStatsSnapshot.empty
-    @State private var range: UsageStatsRange = .last7
+    @State private var storedTakes: [UsageTake] = []
+    @State private var pendingTakes: [UsageTake] = []
+    @State private var range: UsageStatsRange = .days15
     @State private var series: UsageChartSeries = .words
-    @State private var pendingWords = 0
-    @State private var pendingTakes = 0
-    @State private var selectedDay: Date?
+    @State private var clock = Date.now
+    @State private var selectedDate: Date?
     @State private var loadTask: Task<Void, Never>?
     @State private var pendingTask: Task<Void, Never>?
 
     var body: some View {
-        let visible = displayedSnapshot
-        let totals = visible.totals(for: range)
-        let perDay = visible.averageWordsPerDay(for: range)
-        let days = visible.chartDays(for: range)
+        let takes = mergedTakes
+        let snapshot = UsageStatsAggregator.snapshot(
+            takes: takes,
+            range: range,
+            now: clock,
+            calendar: .current
+        )
+        let lifetime = UsageStatsAggregator.totals(in: takes)
+        let lastSTT = UsageStatsAggregator.lastSpeechToTextMilliseconds(in: takes)
 
         Form {
             Section {
-                LabeledContent("Words spoken") {
-                    Text(visible.totalWords.formatted())
-                }
-                LabeledContent("Takes") {
-                    Text(visible.totalTakes.formatted())
-                }
                 Picker("Range", selection: $range) {
                     ForEach(UsageStatsRange.allCases) { option in
                         Text(option.title).tag(option)
@@ -32,18 +31,27 @@ struct StatsSettingsPane: View {
                 }
                 .pickerStyle(.menu)
                 LabeledContent("Words") {
-                    Text(totals.words.formatted())
+                    Text(snapshot.totalWords.formatted())
                 }
                 LabeledContent("Takes") {
-                    Text(totals.takes.formatted())
+                    Text(snapshot.totalTakes.formatted())
                 }
-                LabeledContent("Per day") {
-                    Text(perDay.formatted(.number.precision(.fractionLength(0...1))))
+                LabeledContent {
+                    Text(speechToTextLabel(snapshot.averageSpeechToTextMilliseconds))
+                } label: {
+                    Text("Average speech-to-text")
+                    Text("Stop to transcript")
+                }
+                LabeledContent {
+                    Text(speechToTextLabel(lastSTT.map(Double.init)))
+                } label: {
+                    Text("Last take")
+                    Text("Speech-to-text")
                 }
             } header: {
-                Text("Totals")
+                Text("Usage")
             } footer: {
-                Text("Word counts update after Echo pastes a take. Echo keeps about 120 days of daily totals.")
+                Text(usageFooter(lifetime: lifetime))
                     .settingsFooter()
             }
 
@@ -57,69 +65,88 @@ struct StatsSettingsPane: View {
                 .labelsHidden()
                 .accessibilityLabel("Series")
 
-                if days.allSatisfy({ $0.words == 0 && $0.takes == 0 }) {
-                    ContentUnavailableView(
-                        "No takes in this range",
-                        systemImage: "chart.bar",
-                        description: Text("Paste a take and the bars show up here.")
-                    )
-                    .frame(minHeight: 160)
-                } else {
-                    UsageWordsChart(
-                        days: days,
-                        series: series,
-                        selectedDay: $selectedDay
-                    )
-                    .frame(minHeight: 200)
-                }
+                UsageWordsChart(
+                    buckets: snapshot.buckets,
+                    series: series,
+                    range: range,
+                    domain: snapshot.domain,
+                    selectedDate: $selectedDate
+                )
+                .id(range.id)
+                .frame(minHeight: 200)
+                .animation(nil, value: range)
             } header: {
-                Text("Per day")
+                Text("Per \(range.bucketTitle)")
             } footer: {
-                Text(chartFooter(days: days))
+                Text(chartFooter(snapshot: snapshot))
                     .settingsFooter()
             }
         }
         .echoSettingsForm()
         .onAppear(perform: appear)
         .onDisappear(perform: disappear)
-    }
-
-    private var displayedSnapshot: UsageStatsSnapshot {
-        snapshot.addingPending(
-            words: pendingWords,
-            takes: pendingTakes,
-            today: UsageCalendar.dayKey(for: .now, calendar: .current)
-        )
-    }
-
-    private func chartFooter(days: [UsageChartDay]) -> String {
-        if let selectedDay,
-           let row = days.min(by: { abs($0.date.timeIntervalSince(selectedDay)) < abs($1.date.timeIntervalSince(selectedDay)) }) {
-            let day = row.date.formatted(.dateTime.month(.abbreviated).day())
-            return "\(day): \(row.words.formatted()) words, \(row.takes.formatted()) takes."
+        .onChange(of: range) {
+            selectedDate = nil
+            clock = Date.now
         }
-        return "Each bar is one day. Pick Words or Takes above the chart."
+    }
+
+    private var mergedTakes: [UsageTake] {
+        if pendingTakes.isEmpty { return storedTakes }
+        var merged = storedTakes
+        merged.append(contentsOf: pendingTakes)
+        return merged
+    }
+
+    private func usageFooter(lifetime: (words: Int, takes: Int)) -> String {
+        let kept = "Echo keeps about \(UsageStatsStore.retentionDays) days of takes."
+        let all = "All stored: \(lifetime.words.formatted()) words, \(lifetime.takes.formatted()) takes."
+        return "\(all) Speech-to-text is stop to transcript, before paste or rewrite. \(kept)"
+    }
+
+    private func chartFooter(snapshot: UsageStatsSnapshot) -> String {
+        if snapshot.totalTakes == 0 {
+            return "No takes in this range. Empty bars still span \(range.title.lowercased())."
+        }
+        if let selectedDate,
+           let row = snapshot.buckets.min(by: {
+               abs($0.date.timeIntervalSince(selectedDate)) < abs($1.date.timeIntervalSince(selectedDate))
+           }) {
+            let when = row.date.formatted(range.axisFormat)
+            return "\(when): \(row.words.formatted()) words, \(row.takes.formatted()) takes."
+        }
+        return "Each bar is \(range.bucketTitle). Pick Words or Takes above the chart."
+    }
+
+    private func speechToTextLabel(_ milliseconds: Double?) -> String {
+        guard let milliseconds, milliseconds.isFinite, milliseconds >= 0 else { return "—" }
+        if milliseconds < 1000 {
+            return "\(Int(milliseconds.rounded())) ms"
+        }
+        let seconds = milliseconds / 1000
+        return "\(seconds.formatted(.number.precision(.fractionLength(1...2)))) s"
     }
 
     private func appear() {
         loadTask?.cancel()
         loadTask = Task {
             await UsageStats.flushPending()
-            let next = await UsageStatsStore.shared.snapshot()
+            let next = await UsageStatsStore.shared.allTakes()
             guard !Task.isCancelled else { return }
-            snapshot = next
-            let pending = UsageStats.peekPending()
-            pendingWords = pending.words
-            pendingTakes = pending.takes
+            storedTakes = next
+            pendingTakes = UsageStats.peekPending()
+            clock = Date.now
         }
 
         pendingTask?.cancel()
         pendingTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
-                let pending = UsageStats.peekPending()
-                pendingWords = pending.words
-                pendingTakes = pending.takes
+                let next = await UsageStatsStore.shared.allTakes()
+                guard !Task.isCancelled else { return }
+                storedTakes = next
+                pendingTakes = UsageStats.peekPending()
+                clock = Date.now
             }
         }
     }
@@ -152,38 +179,43 @@ enum UsageChartSeries: String, CaseIterable, Identifiable {
         title
     }
 
-    func value(for day: UsageChartDay) -> Int {
+    func value(for bucket: UsageChartBucket) -> Int {
         switch self {
-        case .words: day.words
-        case .takes: day.takes
+        case .words: bucket.words
+        case .takes: bucket.takes
         }
     }
 }
 
 private struct UsageWordsChart: View {
-    let days: [UsageChartDay]
+    let buckets: [UsageChartBucket]
     let series: UsageChartSeries
-    @Binding var selectedDay: Date?
+    let range: UsageStatsRange
+    let domain: ClosedRange<Date>
+    @Binding var selectedDate: Date?
 
     var body: some View {
-        Chart(days) { day in
+        Chart(buckets) { bucket in
             BarMark(
-                x: .value("Day", day.date, unit: .day),
-                y: .value(series.axisTitle, series.value(for: day))
+                x: .value("Time", bucket.date),
+                y: .value(series.axisTitle, series.value(for: bucket))
             )
             .foregroundStyle(.tint)
 
-            if let selectedDay, Calendar.current.isDate(day.date, inSameDayAs: selectedDay) {
-                RuleMark(x: .value("Selected day", day.date, unit: .day))
+            if let selectedDate,
+               nearestBucket(to: selectedDate)?.date == bucket.date {
+                RuleMark(x: .value("Selected time", bucket.date))
                     .foregroundStyle(.secondary)
             }
         }
-        .chartXSelection(value: $selectedDay)
+        .chartXSelection(value: $selectedDate)
+        .chartXScale(domain: domain)
+        .chartYScale(domain: 0...yMax)
         .chartXAxis {
             AxisMarks(values: .automatic(desiredCount: 6)) { _ in
                 AxisGridLine()
                 AxisTick()
-                AxisValueLabel(format: .dateTime.month(.abbreviated).day(), collisionResolution: .greedy)
+                AxisValueLabel(format: range.axisFormat, collisionResolution: .greedy)
             }
         }
         .chartYAxis {
@@ -193,9 +225,18 @@ private struct UsageWordsChart: View {
                 AxisValueLabel()
             }
         }
-        .chartXAxisLabel("Day")
+        .chartXAxisLabel("Time")
         .chartYAxisLabel(series.axisTitle)
-        .chartYScale(domain: .automatic(includesZero: true))
-        .accessibilityLabel("\(series.title) per day")
+        .accessibilityLabel("\(series.title) over \(range.title)")
+    }
+
+    private var yMax: Int {
+        max(1, buckets.map { series.value(for: $0) }.max() ?? 0)
+    }
+
+    private func nearestBucket(to date: Date) -> UsageChartBucket? {
+        buckets.min {
+            abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date))
+        }
     }
 }

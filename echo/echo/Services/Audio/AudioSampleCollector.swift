@@ -22,7 +22,9 @@ private final class HandlerBox: @unchecked Sendable {
 /// 16 kHz mono sink. The CoreAudio tap only memcpy's into a preallocated ring.
 /// A dedicated consumer thread writes CAF / copies RAM. Never allocate on the tap.
 nonisolated final class AudioSampleCollector: @unchecked Sendable {
-    private static let ringFrames = Int(AudioResampler.targetSampleRate) * 180
+    /// Slack only — the consumer drains as the tap writes. 180 s was 11.5 MB resident.
+    static let ringSeconds = 16
+    private static let ringFrames = Int(AudioResampler.targetSampleRate) * ringSeconds
     /// Whisper / Parakeet stay in RAM until this many frames, then spill to CAF.
     private static let maxRAMFrames = Int(AudioResampler.targetSampleRate) * 90
     private static let drainChunk = 4_096
@@ -218,7 +220,8 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
                 self.liveHandler.withLock { $0.handler = nil }
                 self.flushWork()
                 self.closeWriter()
-                self.samples.removeAll(keepingCapacity: true)
+                self.samples.removeAll(keepingCapacity: false)
+                self.drainBuffer = nil
                 self.spilled = false
                 if let fileURL = self.fileURL {
                     try? FileManager.default.removeItem(at: fileURL)

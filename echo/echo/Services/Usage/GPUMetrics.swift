@@ -1,9 +1,10 @@
 import Darwin
 import Foundation
 import IOKit
+import Metal
 
-/// GPU utilization. Prefer this-process AGX/Metal time; otherwise system GPU, labeled as such.
-/// Never invent 0 when a sample is missing.
+/// GPU. Prefer this-process Metal/AGX time and Metal allocated bytes.
+/// Never invent 0% when a sample is missing.
 nonisolated enum GPUMetrics: Sendable {
     enum Source: String, Sendable, Equatable, Codable {
         case process
@@ -51,6 +52,14 @@ nonisolated enum GPUMetrics: Sendable {
     static func processPercent(from previousNS: UInt64, to currentNS: UInt64, elapsedNS: UInt64) -> Double? {
         guard elapsedNS > 0, currentNS >= previousNS else { return nil }
         return Double(currentNS &- previousNS) / Double(elapsedNS) * 100
+    }
+
+    /// This process’s current Metal heap on attached GPUs. Does not create a device.
+    static func metalAllocatedBytes() -> UInt64? {
+        let devices = MTLCopyAllDevices()
+        guard !devices.isEmpty else { return nil }
+        let total = devices.reduce(UInt64(0)) { $0 + UInt64($1.currentAllocatedSize) }
+        return total
     }
 
     /// Parses IOKit `PerformanceStatistics`. Missing keys stay `nil` — not 0.

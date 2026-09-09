@@ -13,7 +13,7 @@ struct SpokenPathNormalizerTests {
         let sentence = SpokenPathNormalizer.fixtureCases().last!.input
         _ = SpokenPathNormalizer.apply(sentence)
 
-        let took = HotPathBudget.elapsed {
+        let took = HotPathBudget.elapsed("SpokenPathNormalizer.apply warm") {
             _ = SpokenPathNormalizer.apply(sentence)
         }
         #expect(took < HotPathBudget.paragraph, "SpokenPathNormalizer.apply took \(took) (budget \(HotPathBudget.paragraph))")

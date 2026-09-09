@@ -87,6 +87,8 @@ nonisolated final class AppleSTTProvider: TranscriptionProvider, BatchAudioConsu
         sessionLock.lock()
         let fileURL = self.fileURL
         let samples = self.samples
+        self.samples = []
+        self.fileURL = nil
         sessionLock.unlock()
 
         let ownedURL: URL
@@ -135,6 +137,23 @@ nonisolated final class AppleSTTProvider: TranscriptionProvider, BatchAudioConsu
             continuation?.yield(text)
         }
         return text
+    }
+
+    static func evict() {
+        warmLock.lock()
+        let analyzer = warmAnalyzer
+        warmTranscriber = nil
+        warmAnalyzer = nil
+        let task = prewarmTask
+        prewarmTask = nil
+        prewarmGeneration &+= 1
+        warmLock.unlock()
+        task?.cancel()
+        if let analyzer {
+            Task {
+                await analyzer.cancelAndFinishNow()
+            }
+        }
     }
 
     static func prewarm() async {

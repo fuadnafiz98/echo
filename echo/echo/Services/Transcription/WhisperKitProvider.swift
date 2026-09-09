@@ -53,10 +53,14 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
         cacheLock.lock()
         let warm = warmTask
         warmTask = nil
+        let kitToUnload: WhisperKit?
         let cancelled: [Task<CachedKit, Error>]
         if let variant {
             if cached?.variant == variant.rawValue {
+                kitToUnload = cached?.kit
                 cached = nil
+            } else {
+                kitToUnload = nil
             }
             var remaining: [String: InflightLoad] = [:]
             var toCancel: [Task<CachedKit, Error>] = []
@@ -74,6 +78,7 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
             }
         } else {
             cancelled = inflight.values.map(\.task)
+            kitToUnload = cached?.kit
             cached = nil
             inflight.removeAll()
             promptCache = nil
@@ -82,6 +87,11 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
         warm?.cancel()
         for task in cancelled {
             task.cancel()
+        }
+        if let kitToUnload {
+            Task {
+                await kitToUnload.unloadModels()
+            }
         }
     }
 
@@ -115,7 +125,11 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
             partialContinuation = nil
         }
 
-        let (audio, hints) = session.withLock { ($0.samples, $0.vocabularyHints) }
+        let (audio, hints) = session.withLock { state in
+            let take = (state.samples, state.vocabularyHints)
+            state.samples = []
+            return take
+        }
         guard !audio.isEmpty else { return "" }
 
         let loaded = try await Self.loadCached(variant: variant, folder: try Self.requiredFolder(variant))
@@ -208,14 +222,19 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
                 cacheLock.unlock()
                 return loaded
             }
-            let same = cached?.variant == variant.rawValue && cached?.folderPath == path
+            let previous = cached
+            let same = previous?.variant == variant.rawValue && previous?.folderPath == path
             cached = loaded
             inflight[key] = nil
             if !same || warmTask == nil {
                 warmTask?.cancel()
                 warmTask = makeWarmTask(loaded)
             }
+            let stale = (!same && previous != nil) ? previous?.kit : nil
             cacheLock.unlock()
+            if let stale {
+                Task { await stale.unloadModels() }
+            }
             return loaded
         } catch {
             cacheLock.lock()

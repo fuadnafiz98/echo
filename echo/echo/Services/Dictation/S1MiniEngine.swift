@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXLLM
 import MLXLMCommon
 
@@ -52,6 +53,8 @@ actor S1MiniEngine {
         inFlightFolder = nil
         container = nil
         folder = nil
+        Memory.cacheLimit = 32 * 1024 * 1024
+        Memory.clearCache()
     }
 
     private func performLoad(folder: URL, epoch: Int) async throws {

@@ -29,6 +29,6 @@ Default shortcut is ⌘⇧Space. Change it in Settings.
 
 ## Permissions
 
-Microphone. Speech Recognition for Apple. Accessibility to paste (otherwise the transcript stays on the clipboard). Screen Recording is optional — Echo samples a patch of color behind the listening chip so the waveform stays visible, and does not save the image.
+Microphone. Speech Recognition for Apple. Accessibility to paste (otherwise the transcript stays on the clipboard). Echo does not capture or record the screen.
 
 Settings can hide the menu bar extra or the Dock icon. The shortcut still works.

@@ -370,7 +370,6 @@
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Echo needs microphone access to transcribe your speech.";
-				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Echo reads a tiny patch of color behind the listening chip so the waveform stays visible. It does not save the image.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Echo uses speech recognition to convert your voice to text.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -408,7 +407,6 @@
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Echo needs microphone access to transcribe your speech.";
-				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Echo reads a tiny patch of color behind the listening chip so the waveform stays visible. It does not save the image.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Echo uses speech recognition to convert your voice to text.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

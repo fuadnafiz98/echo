@@ -15,6 +15,8 @@ final class EchoCoordinator {
     private var sceneTask: Task<Void, Never>?
     /// Frontmost project terms for local replacements only. Never used to await model polish.
     private var activeScene: DictationScene?
+    /// Stop → transcript milliseconds. Read only after paste in `deliver`.
+    private var pendingRecognitionMs = 0.0
 
     func start() {
         hotkeyService.configure(
@@ -50,16 +52,11 @@ final class EchoCoordinator {
             await Self.prewarmActiveDetached()
         }
 
-        Task {
-            await BackdropSampler.prewarm()
-        }
-
         if !PasteService.isAccessibilityGranted {
             PasteService.requestAccessibility()
         }
 
         UsageStats.startBackgroundFlush()
-        ResourceStats.startBackgroundPersist()
 
         #if DEBUG
         SpokenPathNormalizer.assertFixtureCases()
@@ -71,6 +68,8 @@ final class EchoCoordinator {
         sceneTask = nil
         hotkeyService.stop()
         audioEngine.teardown()
+        ResidentEnginePolicy.cancelIdleUnload()
+        ResidentEnginePolicy.evictAllSpeech()
         Task.detached(priority: .utility) {
             await UsageStats.flushPending()
         }
@@ -107,10 +106,13 @@ final class EchoCoordinator {
             return
         }
 
+        ResidentEnginePolicy.cancelIdleUnload()
+
         do {
             try audioEngine.beginCapture(keepSamplesInMemory: appState.activeProvider != .apple)
         } catch {
             appState.errorMessage = error.localizedDescription
+            ResidentEnginePolicy.scheduleIdleUnload()
             return
         }
 
@@ -151,13 +153,13 @@ final class EchoCoordinator {
                 appState.errorMessage = error.localizedDescription
                 appState.phase = .idle
                 panelController.hide()
+                ResidentEnginePolicy.scheduleIdleUnload()
             }
         }
     }
 
     private func stopRecording() {
         sceneTask?.cancel()
-        panelController.stopBackdropSampling()
         appState.phase = .processing
         let provider = appState.activeProvider
         let start = startTask
@@ -166,6 +168,7 @@ final class EchoCoordinator {
             #if DEBUG
             let t0 = CFAbsoluteTimeGetCurrent()
             #endif
+            let recognitionStarted = CFAbsoluteTimeGetCurrent()
 
             // Flush capture without cancelling if prepare is still finishing.
             let capture = Task(priority: .userInitiated) { await self.audioEngine.endCapture() }
@@ -173,6 +176,7 @@ final class EchoCoordinator {
                 try await start?.value
                 let snapshot = await capture.value
                 let raw = try await transcriptionService.finishAndTranscribe(snapshot: snapshot)
+                pendingRecognitionMs = (CFAbsoluteTimeGetCurrent() - recognitionStarted) * 1000
                 deliver(raw)
                 #if DEBUG
                 let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
@@ -191,12 +195,14 @@ final class EchoCoordinator {
             appState.partialTranscript = ""
             appState.audioLevels = Array(repeating: 0, count: OverlayMetrics.barCount)
             panelController.hide()
+            ResidentEnginePolicy.scheduleIdleUnload()
         }
     }
 
     /// Paste after local cleanup only. Model polish used to block 350–900 ms and can shrink a take.
     private func deliver(_ raw: String) {
         if raw.isEmpty {
+            pendingRecognitionMs = 0
             appState.presentEmptyTakeError()
             return
         }
@@ -210,22 +216,29 @@ final class EchoCoordinator {
             userReplacements: settings.replacements
         )
         PasteService.paste(text: text)
-        UsageStats.recordSuccessfulPaste(wordCount: UsageWords.count(text))
+        UsageStats.recordSuccessfulPaste(
+            wordCount: UsageWords.count(text),
+            speechToTextMilliseconds: pendingRecognitionMs
+        )
+        pendingRecognitionMs = 0
         appState.statusMessage = "Pasted"
     }
 
     func prewarmAfterDownload(_ id: LocalModelID) {
         Task.detached(priority: .utility) {
+            let (type, whisper, parakeet) = await MainActor.run {
+                let state = EchoCoordinator.shared.appState
+                return (state.activeProvider, state.whisperVariant, state.parakeetVariant)
+            }
             switch id {
             case .whisper(let variant):
-                await WhisperKitProvider.prewarm(variant: variant)
+                guard type == .whisper, whisper == variant else { return }
+                await Self.prewarm(type: .whisper, whisperVariant: variant, parakeetVariant: parakeet)
             case .parakeet(let variant):
-                await ParakeetProvider.prewarm(variant: variant)
+                guard type == .parakeet, parakeet == variant else { return }
+                await Self.prewarm(type: .parakeet, whisperVariant: whisper, parakeetVariant: variant)
             case .s1Mini:
-                let wantsS1 = await MainActor.run { DictationSettings.shared.cleanupEngine == .s1Mini }
-                if wantsS1 {
-                    await S1MiniEngine.shared.prewarmFromPresence()
-                }
+                break
             }
         }
     }
@@ -239,24 +252,15 @@ final class EchoCoordinator {
     }
 
     private static func prewarmActiveDetached() async {
-        let (type, whisper, parakeet, cleanup) = await MainActor.run {
+        let (type, whisper, parakeet) = await MainActor.run {
             let state = EchoCoordinator.shared.appState
             return (
                 state.activeProvider,
                 state.whisperVariant,
-                state.parakeetVariant,
-                DictationSettings.shared.cleanupEngine
+                state.parakeetVariant
             )
         }
         await prewarm(type: type, whisperVariant: whisper, parakeetVariant: parakeet)
-        switch cleanup {
-        case .s1Mini:
-            await S1MiniEngine.shared.prewarmFromPresence()
-        case .appleIntelligence:
-            await MainActor.run { TranscriptCleaner.shared.prewarm() }
-        case .off:
-            break
-        }
     }
 
     private static func repairWhisperTokenizers() async {
@@ -279,6 +283,7 @@ final class EchoCoordinator {
         whisperVariant: WhisperVariant,
         parakeetVariant: ParakeetVariant
     ) async {
+        ResidentEnginePolicy.evictInactive(keeping: type)
         switch type {
         case .apple:
             await AppleSTTProvider.prewarm()
@@ -288,6 +293,11 @@ final class EchoCoordinator {
             await ParakeetProvider.prewarm(variant: parakeetVariant)
         case .deepgram, .mistral:
             break
+        }
+        await MainActor.run {
+            if EchoCoordinator.shared.appState.phase == .idle {
+                ResidentEnginePolicy.scheduleIdleUnload()
+            }
         }
     }
 }

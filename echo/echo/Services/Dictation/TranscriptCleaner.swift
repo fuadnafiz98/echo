@@ -52,8 +52,15 @@ final class TranscriptCleaner {
             guard refreshAppleSessionIfNeeded() else { return }
             primedSession?.prewarm(promptPrefix: Prompt("Clean this transcript:\n"))
         case .off:
-            primedSession = nil
-            primedSignature = nil
+            releaseCleanupModels()
+        }
+    }
+
+    func releaseCleanupModels() {
+        primedSession = nil
+        primedSignature = nil
+        Task.detached {
+            await S1MiniEngine.shared.unload()
         }
     }
 
@@ -64,9 +71,11 @@ final class TranscriptCleaner {
         case .s1Mini:
             guard s1MiniAvailable else { return nil }
             guard let budget = polishBudget(for: text) else { return nil }
-            return await withTimeout(budget) {
+            let cleaned = await withTimeout(budget) {
                 try await S1MiniEngine.shared.normalize(text, context: scene.kind.polishContext)
             }
+            await S1MiniEngine.shared.unload()
+            return cleaned
         case .appleIntelligence:
             guard refreshAppleSessionIfNeeded() else { return nil }
             return await polishWithAppleIntelligence(text, scene: scene, glossary: glossary)

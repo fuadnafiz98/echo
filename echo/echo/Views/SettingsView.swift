@@ -64,7 +64,6 @@ private struct EchoAppIconHeader: View {
 private struct GeneralSettingsPane: View {
     @Bindable var appState: AppState
     @Bindable private var settings = DictationSettings.shared
-    @State private var screenCaptureAllowed = BackdropSampler.hasAccess
 
     var body: some View {
         Form {
@@ -140,25 +139,10 @@ private struct GeneralSettingsPane: View {
                     Text("Accessibility")
                     Text("Needed to paste")
                 }
-                LabeledContent {
-                    if screenCaptureAllowed {
-                        Text("Allowed")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        SettingsLink {
-                            Text("Allow")
-                        }
-                        .simultaneousGesture(TapGesture().onEnded(allowScreenRecording))
-                        .accessibilityHint("Lets Echo sample a tiny patch of color behind the listening chip. Echo does not save the image.")
-                    }
-                } label: {
-                    Text("Screen Recording")
-                    Text("Optional, for the chip")
-                }
             } header: {
                 Text("Permissions")
             } footer: {
-                Text("Accessibility lets Echo paste into the app you were using. Without it, the transcript stays on the clipboard. Screen Recording is optional: Echo samples a tiny patch of color behind the chip so the waveform stays visible. It does not save the image.")
+                Text("Accessibility lets Echo paste into the app you were using. Without it, the transcript stays on the clipboard.")
                     .settingsFooter()
             }
 
@@ -182,9 +166,6 @@ private struct GeneralSettingsPane: View {
             }
         }
         .echoSettingsForm()
-        .onAppear {
-            screenCaptureAllowed = BackdropSampler.hasAccess
-        }
     }
 
     private var chromeFooter: String {
@@ -215,15 +196,6 @@ private struct GeneralSettingsPane: View {
 
     private func openAccessibilitySettings() {
         PasteService.openAccessibilitySettings()
-    }
-
-    private func allowScreenRecording() {
-        screenCaptureAllowed = BackdropSampler.requestAccess()
-        if screenCaptureAllowed {
-            Task { await BackdropSampler.prewarm() }
-        } else {
-            PasteService.openScreenRecordingSettings()
-        }
     }
 }
 
@@ -319,9 +291,7 @@ private struct WordsSettingsPane: View {
         }
         .echoSettingsForm()
         .onChange(of: settings.cleanupEngine) {
-            if settings.cleanupEngine != .off {
-                TranscriptCleaner.shared.prewarm()
-            }
+            TranscriptCleaner.shared.releaseCleanupModels()
         }
     }
 

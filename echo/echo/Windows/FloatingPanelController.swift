@@ -7,7 +7,6 @@ final class FloatingPanelController {
     private weak var glassView: NSGlassEffectView?
     private var currentSize = OverlayChipView.chipSize
     private var observeTask: Task<Void, Never>?
-    private var backdropTask: Task<Void, Never>?
     var levelsProvider: (() -> [Float])?
 
     func prewarm() {
@@ -33,13 +32,11 @@ final class FloatingPanelController {
         panel.alphaValue = 1
         panel.orderFront(nil)
         startObserving(appState)
-        startBackdropSampling()
     }
 
     func hide() {
         observeTask?.cancel()
         observeTask = nil
-        stopBackdropSampling()
         panel?.alphaValue = 0
         panel?.orderOut(nil)
         currentSize = OverlayChipView.chipSize
@@ -48,11 +45,6 @@ final class FloatingPanelController {
         }
         chipView?.isProcessing = false
         chipView?.levels = Array(repeating: 0, count: OverlayMetrics.barCount)
-    }
-
-    func stopBackdropSampling() {
-        backdropTask?.cancel()
-        backdropTask = nil
     }
 
     private func makePanel() -> (panel: NSPanel, chip: OverlayChipView, glass: NSGlassEffectView) {
@@ -118,27 +110,6 @@ final class FloatingPanelController {
         }
         if !processing {
             chipView?.levels = levelsProvider?() ?? appState.audioLevels
-        }
-    }
-
-    private func startBackdropSampling() {
-        backdropTask?.cancel()
-        backdropTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(70))
-            guard !Task.isCancelled else { return }
-            await self?.refreshBackdrop()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(1600))
-                guard !Task.isCancelled else { return }
-                await self?.refreshBackdrop()
-            }
-        }
-    }
-
-    private func refreshBackdrop() async {
-        guard let panel, let chipView else { return }
-        if let isDark = await BackdropSampler.isDark(below: panel) {
-            chipView.backdropIsDark = isDark
         }
     }
 

@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 nonisolated enum ResourceHistoryWindow: String, CaseIterable, Identifiable, Sendable {
     case live15
@@ -59,11 +58,18 @@ nonisolated struct ResourceChartPoint: Sendable, Equatable, Identifiable {
     var residentBytes: UInt64
     var gpuPercent: Double?
     var gpuSource: GPUMetrics.Source?
+    var neuralReclaimableBytes: UInt64 = 0
+    var systemCPUPercent: Double?
+    var metalAllocatedBytes: UInt64?
 
     var id: Date { date }
 
     var memoryMegabytes: Double {
         Double(memoryBytes) / 1_048_576
+    }
+
+    var neuralMegabytes: Double {
+        Double(neuralReclaimableBytes) / 1_048_576
     }
 }
 
@@ -74,6 +80,9 @@ nonisolated struct ResourceMinuteSample: Codable, Sendable, Equatable, Identifia
     var rss: UInt64
     var gpu: Float?
     var src: GPUMetrics.Source?
+    var nrl: UInt64? = nil
+    var sys: Float? = nil
+    var mtl: UInt64? = nil
 
     var id: Int64 { t }
 
@@ -88,7 +97,10 @@ nonisolated struct ResourceMinuteSample: Codable, Sendable, Equatable, Identifia
             memoryBytes: mem,
             residentBytes: rss,
             gpuPercent: gpu.map(Double.init),
-            gpuSource: src
+            gpuSource: src,
+            neuralReclaimableBytes: nrl ?? 0,
+            systemCPUPercent: sys.map(Double.init),
+            metalAllocatedBytes: mtl
         )
     }
 }
@@ -116,82 +128,50 @@ nonisolated enum ResourceDownsample: Sendable {
         let gpuValues = slice.compactMap(\.gpu)
         let gpu = gpuValues.isEmpty ? nil : gpuValues.reduce(0, +) / Float(gpuValues.count)
         let src = slice.reversed().compactMap(\.src).first
+        let nrlValues = slice.compactMap(\.nrl)
+        let nrl = nrlValues.isEmpty
+            ? nil
+            : UInt64((nrlValues.reduce(0.0) { $0 + Double($1) } / Double(nrlValues.count)).rounded())
+        let sysValues = slice.compactMap(\.sys)
+        let sys = sysValues.isEmpty ? nil : sysValues.reduce(0, +) / Float(sysValues.count)
+        let mtlValues = slice.compactMap(\.mtl)
+        let mtl = mtlValues.isEmpty
+            ? nil
+            : UInt64((mtlValues.reduce(0.0) { $0 + Double($1) } / Double(mtlValues.count)).rounded())
         return ResourceMinuteSample(
             t: slice[slice.startIndex].t,
             cpu: cpu,
             mem: mem,
             rss: rss,
             gpu: gpu,
-            src: src
+            src: src,
+            nrl: nrl,
+            sys: sys,
+            mtl: mtl
         )
     }
 }
 
-/// Minute-resolution persist. Never call from `deliver`, the audio tap, or overlay show.
+/// Persist helpers. Live 1 Hz belongs on the Resources tab, not at launch.
 nonisolated enum ResourceStats: Sendable {
-    private static let persistLoopStarted = OSAllocatedUnfairLock(initialState: false)
-
-    static func startBackgroundPersist() {
-        let alreadyStarted = persistLoopStarted.withLock { started -> Bool in
-            if started { return true }
-            started = true
-            return false
-        }
-        guard !alreadyStarted else { return }
-        Task.detached(priority: .utility) {
-            var previousMetrics: ProcessMetrics.Raw?
-            var previousGPUTimeNS: UInt64?
-            var previousWallNS: UInt64?
-            previousMetrics = ProcessMetrics.read()
-            let firstGPU = GPUMetrics.readRaw()
-            previousGPUTimeNS = firstGPU.processGPUTimeNS
-            previousWallNS = ProcessMetrics.nanoseconds(fromMachTicks: mach_absolute_time())
-
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
-                guard let sample = capture(
-                    previousMetrics: &previousMetrics,
-                    previousGPUTimeNS: &previousGPUTimeNS,
-                    previousWallNS: &previousWallNS
-                ) else { continue }
-                await ResourceStatsStore.shared.upsert(sample)
-            }
-        }
-    }
+    static let persistInterval: Duration = .seconds(60)
 
     static func capture(
         previousMetrics: inout ProcessMetrics.Raw?,
         previousGPUTimeNS: inout UInt64?,
         previousWallNS: inout UInt64?
     ) -> ResourceMinuteSample? {
-        guard let raw = ProcessMetrics.read() else { return nil }
-        let gpuRaw = GPUMetrics.readRaw()
-        let wallNS = ProcessMetrics.nanoseconds(fromMachTicks: raw.wallTicks)
-        var cpu = 0.0
-        if let previousMetrics {
-            cpu = ProcessMetrics.cpuPercent(from: previousMetrics, to: raw)
-        }
-        previousMetrics = raw
-
-        let reading = reading(
-            gpuRaw: gpuRaw,
+        var sampler = ResourceSampler(
+            previousProcess: previousMetrics,
             previousGPUTimeNS: previousGPUTimeNS,
-            previousWallNS: previousWallNS,
-            wallNS: wallNS
+            previousWallNS: previousWallNS
         )
-        previousGPUTimeNS = gpuRaw.processGPUTimeNS
-        previousWallNS = wallNS
-
-        let memory = raw.footprintBytes > 0 ? raw.footprintBytes : raw.residentBytes
-        let minute = (Int64(Date.now.timeIntervalSince1970) / 60) * 60
-        return ResourceMinuteSample(
-            t: minute,
-            cpu: Float(cpu),
-            mem: memory,
-            rss: raw.residentBytes,
-            gpu: reading.map { Float($0.percent) },
-            src: reading?.source
-        )
+        let sample = sampler.tick()
+        previousMetrics = sampler.previousProcess
+        previousGPUTimeNS = sampler.previousGPUTimeNS
+        previousWallNS = sampler.previousWallNS
+        guard let sample, sample.processCPUPercent != nil else { return nil }
+        return ResourceSampler.minuteSample(from: sample)
     }
 
     static func reading(
