@@ -2,9 +2,19 @@ import AVFoundation
 import FluidAudio
 import os
 
+/// Parakeet deliberately does **not** transcribe window by window while recording.
+///
+/// FluidAudio splits long audio itself, and its own chunking resets the TDT decoder state for every
+/// chunk and stitches them using overlapping context frames. Threading one decoder state across
+/// hand-cut windows, which is what an incremental version here would do, is not the contract the
+/// library is built around and risks quietly degrading the transcript. Parakeet decodes far faster
+/// than real time, so handing it the whole take at stop is a modest, predictable cost.
+///
+/// Apple Speech, the default engine, does stream — see ``AppleSTTProvider``.
 nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsumer, @unchecked Sendable {
     private let variant: ParakeetVariant
-    private var samples: [Float] = []
+    private let sessionLock = NSLock()
+    private var capture: AudioCaptureSnapshot?
     private var partialContinuation: AsyncStream<String>.Continuation?
 
     private struct CachedManager: Sendable {
@@ -86,7 +96,10 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
     }
 
     func startStreaming() async throws {
-        samples = []
+        sessionLock.lock()
+        capture = nil
+        sessionLock.unlock()
+
         guard let folder = LocalModelPresence.folder(for: .parakeet(variant)) else {
             throw TranscriptionError.modelNotDownloaded
         }
@@ -94,8 +107,10 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
         await Self.waitForWarm(loaded)
     }
 
-    func consumeSamples(_ samples: [Float]) {
-        self.samples = samples
+    func consumeCapture(_ capture: AudioCaptureSnapshot) {
+        sessionLock.lock()
+        self.capture = capture
+        sessionLock.unlock()
     }
 
     func stopStreaming() async throws -> String {
@@ -104,8 +119,12 @@ nonisolated final class ParakeetProvider: TranscriptionProvider, BatchAudioConsu
             partialContinuation = nil
         }
 
-        let audio = samples
-        samples = []
+        sessionLock.lock()
+        let capture = self.capture
+        self.capture = nil
+        sessionLock.unlock()
+
+        let audio = capture?.resolvedSamples() ?? []
         guard !audio.isEmpty else { return "" }
 
         let loaded = try await Self.loadCached(variant: variant, folder: try Self.requiredFolder(variant))

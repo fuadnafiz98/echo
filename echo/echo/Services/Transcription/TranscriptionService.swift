@@ -32,6 +32,15 @@ final class TranscriptionService {
             }
         }
 
+        // Hooked *before* `startStreaming`. The microphone is already running by now, and
+        // building the analyzer takes a moment; the provider queues whatever arrives in the
+        // meantime so the opening words are not lost.
+        if let streamer = provider as? StreamingAudioConsumer {
+            collector.setDrainedHandler { [weak streamer] buffer in
+                streamer?.consumeStreamingBuffer(buffer)
+            }
+        }
+
         try await Task.detached(priority: .userInitiated) {
             try await provider.startStreaming()
         }.value
@@ -47,13 +56,14 @@ final class TranscriptionService {
     func finishAndTranscribe(snapshot: AudioCaptureSnapshot) async throws -> String {
         guard let provider = activeProvider else { return "" }
         collector?.setLiveHandler(nil)
+        collector?.setDrainedHandler(nil)
 
         if let fileConsumer = provider as? FileAudioConsumer, let url = snapshot.fileURL {
             fileConsumer.consumeFile(url)
         }
         let needsRAM = !(provider is AppleSTTProvider) || snapshot.fileURL == nil
         if needsRAM, let batch = provider as? BatchAudioConsumer {
-            batch.consumeSamples(snapshot.samples)
+            batch.consumeCapture(snapshot)
         }
 
         let leftover = collector
@@ -84,6 +94,8 @@ final class TranscriptionService {
 
     func cancel() async {
         collector?.setLiveHandler(nil)
+        collector?.setDrainedHandler(nil)
+        await activeProvider?.cancelStreaming()
         await collector?.cleanupRecordingFile()
         activeProvider = nil
         collector = nil

@@ -1,9 +1,19 @@
 import AppKit
 import CoreGraphics
 
+/// One pasteboard's worth of items, as raw data per type.
+typealias ClipboardSnapshot = [[NSPasteboard.PasteboardType: Data]]
+
 @MainActor
 enum PasteService {
     private static var restoreTask: Task<Void, Never>?
+
+    /// Per-item cap when snapshotting for restore.
+    ///
+    /// Copying a large image or a file promise out of the pasteboard takes real time, and doing
+    /// it at paste time put that cost between the transcript and the text landing. Anything
+    /// bigger than this is not preserved; the transcript still pastes.
+    static let maxRestorableBytesPerItem = 4 * 1024 * 1024
 
     static var isAccessibilityGranted: Bool {
         AXIsProcessTrusted()
@@ -12,10 +22,18 @@ enum PasteService {
     /// Pastes `text` into whatever the user was focused on before the chip appeared.
     /// Returns true if the simulated keystroke was sent, false if accessibility is not granted
     /// (text is still placed on the clipboard so the user can Cmd+V manually).
+    /// Reads the current pasteboard so it can be put back after the paste.
+    ///
+    /// Call this during the take, not at paste time.
+    static func snapshotClipboard() -> ClipboardSnapshot {
+        guard DictationSettings.shared.restoreClipboard else { return [] }
+        return snapshot(NSPasteboard.general)
+    }
+
     @discardableResult
-    static func paste(text: String) -> Bool {
+    static func paste(text: String, previousClipboard: ClipboardSnapshot? = nil) -> Bool {
         let pasteboard = NSPasteboard.general
-        let previous = snapshot(pasteboard)
+        let previous = previousClipboard ?? snapshot(pasteboard)
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -95,21 +113,31 @@ enum PasteService {
         }
     }
 
-    private static func snapshot(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
+    /// Oversized items are dropped, not recorded as empty.
+    ///
+    /// An empty payload would still count as "something to restore", and restoring it clears the
+    /// pasteboard and writes nothing back — losing both the original content and the transcript.
+    /// Returning no items at all leaves the transcript on the clipboard, which is the intent.
+    private static func snapshot(_ pasteboard: NSPasteboard) -> ClipboardSnapshot {
         guard let items = pasteboard.pasteboardItems, !items.isEmpty else { return [] }
-        return items.map { item in
+        return items.compactMap { item -> [NSPasteboard.PasteboardType: Data]? in
             var payload: [NSPasteboard.PasteboardType: Data] = [:]
+            var bytes = 0
             for type in item.types {
-                if let data = item.data(forType: type) {
-                    payload[type] = data
+                guard let data = item.data(forType: type) else { continue }
+                bytes += data.count
+                if bytes > maxRestorableBytesPerItem {
+                    Latency.note("clipboard item too large to restore — leaving the transcript on the clipboard")
+                    return nil
                 }
+                payload[type] = data
             }
-            return payload
+            return payload.isEmpty ? nil : payload
         }
     }
 
     private static func restore(
-        _ snapshot: [[NSPasteboard.PasteboardType: Data]],
+        _ snapshot: ClipboardSnapshot,
         to pasteboard: NSPasteboard
     ) {
         pasteboard.clearContents()

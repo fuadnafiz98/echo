@@ -7,20 +7,27 @@ nonisolated enum UsageWords: Sendable {
     }
 }
 
-/// One successful paste. `ms` is stop → transcript ready, before cleanup / paste / polish.
+/// One successful paste.
+///
+/// `ms` is stop → transcript ready. `pms` is stop → text actually pasted, so it also covers local
+/// cleanup, the clipboard write and the synthetic keystroke. `pms` is what the user feels; `ms`
+/// alone under-reported the wait.
 nonisolated struct UsageTake: Codable, Sendable, Equatable {
     var t: Int64
     var w: Int
     var ms: Int?
+    var pms: Int?
 
     var words: Int { w }
     var speechToTextMilliseconds: Int? { ms }
+    var pasteMilliseconds: Int? { pms }
     var date: Date { Date(timeIntervalSince1970: TimeInterval(t)) }
 
-    init(t: Int64, words: Int, speechToTextMilliseconds: Int? = nil) {
+    init(t: Int64, words: Int, speechToTextMilliseconds: Int? = nil, pasteMilliseconds: Int? = nil) {
         self.t = t
         self.w = words
         self.ms = speechToTextMilliseconds
+        self.pms = pasteMilliseconds
     }
 
     init(from decoder: Decoder) throws {
@@ -28,12 +35,14 @@ nonisolated struct UsageTake: Codable, Sendable, Equatable {
         t = try container.decode(Int64.self, forKey: .t)
         w = try container.decode(Int.self, forKey: .w)
         ms = try container.decodeIfPresent(Int.self, forKey: .ms)
+        pms = try container.decodeIfPresent(Int.self, forKey: .pms)
     }
 
     enum CodingKeys: String, CodingKey {
         case t
         case w
         case ms
+        case pms
     }
 
     func encode(to encoder: Encoder) throws {
@@ -41,6 +50,7 @@ nonisolated struct UsageTake: Codable, Sendable, Equatable {
         try container.encode(t, forKey: .t)
         try container.encode(w, forKey: .w)
         try container.encodeIfPresent(ms, forKey: .ms)
+        try container.encodeIfPresent(pms, forKey: .pms)
     }
 }
 
@@ -147,6 +157,7 @@ nonisolated struct UsageStatsSnapshot: Sendable, Equatable {
     var totalWords: Int
     var totalTakes: Int
     var averageSpeechToTextMilliseconds: Double?
+    var averagePasteMilliseconds: Double?
     var domain: ClosedRange<Date>
 
     static let empty = UsageStatsSnapshot(
@@ -154,6 +165,7 @@ nonisolated struct UsageStatsSnapshot: Sendable, Equatable {
         totalWords: 0,
         totalTakes: 0,
         averageSpeechToTextMilliseconds: nil,
+        averagePasteMilliseconds: nil,
         domain: Date(timeIntervalSince1970: 0)...Date(timeIntervalSince1970: 1)
     )
 }
@@ -190,6 +202,8 @@ nonisolated enum UsageStatsAggregator: Sendable {
         var takeCount = 0
         var sttSum = 0
         var sttCount = 0
+        var pasteSum = 0
+        var pasteCount = 0
 
         let startTs = Int64(start.timeIntervalSince1970)
         let endTs = Int64(now.timeIntervalSince1970)
@@ -212,16 +226,22 @@ nonisolated enum UsageStatsAggregator: Sendable {
                     sttSum += ms
                     sttCount += 1
                 }
+                if let pms = take.pms {
+                    pasteSum += pms
+                    pasteCount += 1
+                }
             }
             index += 1
         }
 
         let average = sttCount == 0 ? nil : Double(sttSum) / Double(sttCount)
+        let pasteAverage = pasteCount == 0 ? nil : Double(pasteSum) / Double(pasteCount)
         return UsageStatsSnapshot(
             buckets: buckets,
             totalWords: words,
             totalTakes: takeCount,
             averageSpeechToTextMilliseconds: average,
+            averagePasteMilliseconds: pasteAverage,
             domain: start...end
         )
     }
@@ -323,12 +343,17 @@ nonisolated enum UsageStats: Sendable {
     private static let pending = OSAllocatedUnfairLock(initialState: [UsageTake]())
     private static let flushLoopStarted = OSAllocatedUnfairLock(initialState: false)
 
-    static func recordSuccessfulPaste(wordCount: Int, speechToTextMilliseconds: Double) {
+    static func recordSuccessfulPaste(
+        wordCount: Int,
+        speechToTextMilliseconds: Double,
+        pasteMilliseconds: Double? = nil
+    ) {
         let milliseconds = max(0, Int(speechToTextMilliseconds.rounded()))
         let take = UsageTake(
             t: Int64(Date().timeIntervalSince1970),
             words: wordCount,
-            speechToTextMilliseconds: milliseconds
+            speechToTextMilliseconds: milliseconds,
+            pasteMilliseconds: pasteMilliseconds.map { max(0, Int($0.rounded())) }
         )
         pending.withLock { $0.append(take) }
     }

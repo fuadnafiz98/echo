@@ -2,7 +2,7 @@ import AVFoundation
 import Foundation
 
 nonisolated final class MistralProvider: TranscriptionProvider, BatchAudioConsumer, @unchecked Sendable {
-    private var samples: [Float] = []
+    private var capture: AudioCaptureSnapshot?
     private var partialContinuation: AsyncStream<String>.Continuation?
 
     var partialTranscript: AsyncStream<String> {
@@ -12,13 +12,13 @@ nonisolated final class MistralProvider: TranscriptionProvider, BatchAudioConsum
     }
 
     func startStreaming() async throws {
-        samples = []
+        capture = nil
         let key = UserDefaults.standard.string(forKey: "mistralAPIKey") ?? ""
         guard !key.isEmpty else { throw TranscriptionError.missingAPIKey }
     }
 
-    func consumeSamples(_ samples: [Float]) {
-        self.samples = samples
+    func consumeCapture(_ capture: AudioCaptureSnapshot) {
+        self.capture = capture
     }
 
     func stopStreaming() async throws -> String {
@@ -29,6 +29,8 @@ nonisolated final class MistralProvider: TranscriptionProvider, BatchAudioConsum
 
         let key = UserDefaults.standard.string(forKey: "mistralAPIKey") ?? ""
         guard !key.isEmpty else { throw TranscriptionError.missingAPIKey }
+        let samples = capture?.resolvedSamples() ?? []
+        capture = nil
         guard !samples.isEmpty else { return "" }
 
         let wav = AudioResampler.wavData(from: samples)

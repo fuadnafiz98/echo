@@ -1,10 +1,10 @@
-import os
+import AppKit
 import SwiftUI
+import os
 
 @Observable @MainActor
 final class EchoCoordinator {
     static let shared = EchoCoordinator()
-    private static let latencyLog = Logger(subsystem: "echo", category: "latency")
 
     let appState = AppState()
     private let hotkeyService = HotkeyService()
@@ -12,13 +12,24 @@ final class EchoCoordinator {
     private let transcriptionService = TranscriptionService()
     private let panelController = FloatingPanelController()
     private var startTask: Task<Void, Error>?
+    private var captureTask: Task<Void, Error>?
     private var sceneTask: Task<Void, Never>?
+    private var clipboardTask: Task<ClipboardSnapshot, Never>?
+    private var wakeObservers: [NSObjectProtocol] = []
     /// Frontmost project terms for local replacements only. Never used to await model polish.
     private var activeScene: DictationScene?
     /// Stop → transcript milliseconds. Read only after paste in `deliver`.
     private var pendingRecognitionMs = 0.0
+    /// Wall clock at the moment the user pressed stop. Used for the stop → paste figure.
+    private var pendingStopAt: CFAbsoluteTime = 0
+    /// Wall clock at the moment the take was started, for the first-audio figure.
+    private var takePressedAt: CFAbsoluteTime = 0
+    /// Clipboard captured during the take, restored after the paste.
+    private var pendingClipboard: ClipboardSnapshot = []
 
     func start() {
+        let launchedAt = CFAbsoluteTimeGetCurrent()
+
         hotkeyService.configure(
             keyCode: appState.hotkeyKeyCode,
             modifiers: appState.hotkeyModifiers,
@@ -33,15 +44,19 @@ final class EchoCoordinator {
 
         hotkeyService.start()
         panelController.prewarm()
+        Latency.launch(Latency.milliseconds(since: launchedAt))
+
+        observeSystemWake()
 
         Task {
             let granted = await MicrophonePermission.request()
             if granted {
-                try? audioEngine.prepareGraph()
+                audioEngine.prepareGraph()
             }
         }
 
         Task.detached(priority: .utility) {
+            AudioSampleCollector.pruneStaleTemporaryRecordings()
             LocalModelPresence.rebuildAll()
             await Self.repairWhisperTokenizers()
             let records = LocalModelPresence.snapshot()
@@ -66,12 +81,48 @@ final class EchoCoordinator {
     func stop() {
         sceneTask?.cancel()
         sceneTask = nil
+        clipboardTask?.cancel()
+        clipboardTask = nil
+        for observer in wakeObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        wakeObservers = []
         hotkeyService.stop()
         audioEngine.teardown()
         ResidentEnginePolicy.cancelIdleUnload()
-        ResidentEnginePolicy.evictAllSpeech()
+        ResidentEnginePolicy.evictEverything()
+        AppChrome.endTakeActivity()
         Task.detached(priority: .utility) {
             await UsageStats.flushPending()
+        }
+    }
+
+    /// Sleep parks CoreAudio and can invalidate the installed tap, and a napped process comes
+    /// back with cold caches. Re-arm both instead of making the next take pay for it.
+    private func observeSystemWake() {
+        let center = NSWorkspace.shared.notificationCenter
+        let names: [Notification.Name] = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification,
+        ]
+        for name in names {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                Task { @MainActor in
+                    EchoCoordinator.shared.handleSystemWake()
+                }
+            }
+            wakeObservers.append(observer)
+        }
+    }
+
+    private func handleSystemWake() {
+        guard appState.phase == .idle else { return }
+        Latency.note("system wake — re-arming audio graph and engine")
+        AppChrome.beginIdleActivity()
+        audioEngine.refreshGraph()
+        Task.detached(priority: .utility) {
+            await Self.prewarmActiveDetached()
         }
     }
 
@@ -100,21 +151,23 @@ final class EchoCoordinator {
         }
     }
 
+    /// Order matters: everything before `panelController.show` is on the hotkey's critical path.
+    ///
+    /// Starting the microphone used to come first and it is a CoreAudio device start — tens of
+    /// milliseconds warm, far more after the device has idled — so the overlay only appeared once
+    /// the hardware was live. Capture now starts concurrently. Audio genuinely does not exist until
+    /// the device is running, so a cold start still clips the first instant; what changed is that
+    /// the user sees Echo listening immediately instead of staring at nothing.
     private func startRecording() {
+        let pressedAt = CFAbsoluteTimeGetCurrent()
+
         if !appState.isLocalEngineReady() {
             appState.errorMessage = TranscriptionError.modelNotDownloaded.errorDescription
             return
         }
 
         ResidentEnginePolicy.cancelIdleUnload()
-
-        do {
-            try audioEngine.beginCapture(keepSamplesInMemory: appState.activeProvider != .apple)
-        } catch {
-            appState.errorMessage = error.localizedDescription
-            ResidentEnginePolicy.scheduleIdleUnload()
-            return
-        }
+        AppChrome.beginTakeActivity()
 
         appState.partialTranscript = ""
         appState.errorMessage = nil
@@ -124,14 +177,30 @@ final class EchoCoordinator {
         sceneTask?.cancel()
         activeScene = nil
         panelController.show(appState: appState)
+        Latency.hotkeyToChip(Latency.milliseconds(since: pressedAt))
+
+        takePressedAt = pressedAt
+        let keepSamplesInMemory = appState.activeProvider != .apple
+        let capture = Task(priority: .userInitiated) {
+            let coldStart = try await audioEngine.beginCapture(keepSamplesInMemory: keepSamplesInMemory)
+            Latency.engineRunning(Latency.milliseconds(since: pressedAt), restarted: coldStart)
+        }
+        captureTask = capture
 
         startTask = Task(priority: .userInitiated) {
             try await transcriptionService.prepare(
                 providerType: appState.activeProvider,
                 whisperVariant: appState.whisperVariant,
                 parakeetVariant: appState.parakeetVariant,
-                collector: audioEngine.sampleCollector
+                collector: audioEngine.sampleCollector,
+                vocabularyHints: DictationSettings.shared.vocabulary
             )
+        }
+
+        // Reading the previous clipboard can be slow when it holds an image or a file promise,
+        // so it happens during the take rather than at paste time.
+        clipboardTask = Task(priority: .utility) {
+            PasteService.snapshotClipboard()
         }
 
         sceneTask = Task {
@@ -145,6 +214,7 @@ final class EchoCoordinator {
 
         Task {
             do {
+                try await capture.value
                 try await startTask?.value
             } catch {
                 guard appState.phase == .recording else { return }
@@ -153,6 +223,7 @@ final class EchoCoordinator {
                 appState.errorMessage = error.localizedDescription
                 appState.phase = .idle
                 panelController.hide()
+                AppChrome.endTakeActivity()
                 ResidentEnginePolicy.scheduleIdleUnload()
             }
         }
@@ -163,38 +234,45 @@ final class EchoCoordinator {
         appState.phase = .processing
         let provider = appState.activeProvider
         let start = startTask
+        let capture = captureTask
+        let stoppedAt = CFAbsoluteTimeGetCurrent()
+        pendingStopAt = stoppedAt
 
         Task(priority: .userInitiated) {
-            #if DEBUG
-            let t0 = CFAbsoluteTimeGetCurrent()
-            #endif
-            let recognitionStarted = CFAbsoluteTimeGetCurrent()
-
             // Flush capture without cancelling if prepare is still finishing.
-            let capture = Task(priority: .userInitiated) { await self.audioEngine.endCapture() }
+            if let delay = audioEngine.firstBufferDelay(since: takePressedAt) {
+                Latency.firstBuffer(delay)
+            }
+            let flush = Task(priority: .userInitiated) { await self.audioEngine.endCapture() }
             do {
+                _ = try? await capture?.value
                 try await start?.value
-                let snapshot = await capture.value
+                let snapshot = await flush.value
                 let raw = try await transcriptionService.finishAndTranscribe(snapshot: snapshot)
-                pendingRecognitionMs = (CFAbsoluteTimeGetCurrent() - recognitionStarted) * 1000
-                deliver(raw)
-                #if DEBUG
-                let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-                Self.latencyLog.debug(
-                    "stop→paste \(ms, format: .fixed(precision: 1))ms provider=\(provider.rawValue, privacy: .public) samples=\(snapshot.samples.count)"
+                pendingRecognitionMs = Latency.milliseconds(since: stoppedAt)
+                pendingClipboard = await clipboardTask?.value ?? []
+                Latency.recognition(
+                    pendingRecognitionMs,
+                    provider: provider.rawValue,
+                    seconds: snapshot.seconds,
+                    streamed: provider == .apple && AppleSTTProvider.lastTakeWasStreamed
                 )
-                #endif
+                deliver(raw)
             } catch {
-                _ = await capture.value
+                _ = await flush.value
                 await transcriptionService.cancel()
                 appState.errorMessage = error.localizedDescription
             }
 
             startTask = nil
+            captureTask = nil
+            clipboardTask = nil
+            pendingClipboard = []
             appState.phase = .idle
             appState.partialTranscript = ""
             appState.audioLevels = Array(repeating: 0, count: OverlayMetrics.barCount)
             panelController.hide()
+            AppChrome.endTakeActivity()
             ResidentEnginePolicy.scheduleIdleUnload()
         }
     }
@@ -215,11 +293,15 @@ final class EchoCoordinator {
             projectTerms: projectTerms,
             userReplacements: settings.replacements
         )
-        PasteService.paste(text: text)
+        PasteService.paste(text: text, previousClipboard: pendingClipboard)
+        let words = UsageWords.count(text)
+        let pasteMs = (CFAbsoluteTimeGetCurrent() - pendingStopAt) * 1000
         UsageStats.recordSuccessfulPaste(
-            wordCount: UsageWords.count(text),
-            speechToTextMilliseconds: pendingRecognitionMs
+            wordCount: words,
+            speechToTextMilliseconds: pendingRecognitionMs,
+            pasteMilliseconds: pasteMs
         )
+        Latency.paste(pasteMs, provider: appState.activeProvider.rawValue, words: words)
         pendingRecognitionMs = 0
         appState.statusMessage = "Pasted"
     }

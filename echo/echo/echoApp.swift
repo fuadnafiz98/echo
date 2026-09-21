@@ -82,10 +82,47 @@ enum SettingsWindowMetrics {
 }
 
 enum AppChrome {
+    /// Held for the process lifetime. Without it a windowless accessory app is App Napped
+    /// after a few idle minutes: timers coalesce, QoS drops, and the first hotkey press
+    /// after a long idle takes far longer than a warm one.
+    @MainActor
+    private static var idleActivity: NSObjectProtocol?
+
+    /// Held only while a take is in flight.
+    @MainActor
+    private static var takeActivity: NSObjectProtocol?
+
     @MainActor
     static func applyAtLaunch() {
         applyDockVisibility(DictationSettings.shared.showInDock)
         ProcessInfo.processInfo.disableAutomaticTermination("Echo stays running")
+        beginIdleActivity()
+    }
+
+    @MainActor
+    static func beginIdleActivity() {
+        guard idleActivity == nil else { return }
+        idleActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Echo must answer the dictation hotkey instantly"
+        )
+    }
+
+    /// Latency-critical for the duration of one take. Ended in `endTakeActivity`.
+    @MainActor
+    static func beginTakeActivity() {
+        guard takeActivity == nil else { return }
+        takeActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.latencyCritical, .userInitiated],
+            reason: "Echo is capturing and transcribing"
+        )
+    }
+
+    @MainActor
+    static func endTakeActivity() {
+        guard let takeActivity else { return }
+        ProcessInfo.processInfo.endActivity(takeActivity)
+        self.takeActivity = nil
     }
 
     @MainActor

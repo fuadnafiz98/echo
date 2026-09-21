@@ -269,8 +269,30 @@ nonisolated enum SpokenPathNormalizer: Sendable {
 
     // MARK: - Regex
 
-    private static func replace(_ text: String, pattern: String, with template: String) -> String {
+    /// Patterns here are compile-time literals from a fixed set, so caching them is bounded.
+    /// Recompiling each one on every paste was measurable work on the one path users feel.
+    private static let regexCacheLock = NSLock()
+    nonisolated(unsafe) private static var regexCache: [String: NSRegularExpression] = [:]
+
+    private static func compiled(_ pattern: String) -> NSRegularExpression? {
+        regexCacheLock.lock()
+        if let hit = regexCache[pattern] {
+            regexCacheLock.unlock()
+            return hit
+        }
+        regexCacheLock.unlock()
+
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        regexCacheLock.lock()
+        regexCache[pattern] = regex
+        regexCacheLock.unlock()
+        return regex
+    }
+
+    private static func replace(_ text: String, pattern: String, with template: String) -> String {
+        guard let regex = compiled(pattern) else {
             return text
         }
         let range = NSRange(text.startIndex..., in: text)
@@ -292,7 +314,7 @@ nonisolated enum SpokenPathNormalizer: Sendable {
         pattern: String,
         transform: (String, String, NSRange) -> String
     ) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        guard let regex = compiled(pattern) else {
             return text
         }
         let ns = text as NSString

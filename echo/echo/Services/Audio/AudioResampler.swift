@@ -1,7 +1,9 @@
 import AVFoundation
 import Accelerate
 
-enum AudioResampler {
+/// Called from the CoreAudio tap, the collector's IO queue and detached tasks, so it must not
+/// inherit the project's default main-actor isolation.
+nonisolated enum AudioResampler {
     static let targetSampleRate: Double = 16_000
 
     static func mono16kFormat() -> AVAudioFormat {
@@ -66,6 +68,30 @@ enum AudioResampler {
         return buffer
     }
 
+    /// Deep copy that works for any sample format.
+    ///
+    /// Not float-specific on purpose: `SpeechAnalyzer` asks for 16-bit integer samples, and a
+    /// copy that reached for `floatChannelData` would silently return nil for those buffers.
+    static func copy(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let frames = source.frameLength
+        guard frames > 0,
+              let destination = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: frames)
+        else { return nil }
+        destination.frameLength = frames
+
+        let input = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: source.audioBufferList)
+        )
+        let output = UnsafeMutableAudioBufferListPointer(destination.mutableAudioBufferList)
+        guard input.count == output.count else { return nil }
+        for index in 0..<input.count {
+            guard let from = input[index].mData, let to = output[index].mData else { return nil }
+            let bytes = Int(min(input[index].mDataByteSize, output[index].mDataByteSize))
+            memcpy(to, from, bytes)
+        }
+        return destination
+    }
+
     static func floats(from buffer: AVAudioPCMBuffer) -> [Float] {
         guard let channel = buffer.floatChannelData?[0] else { return [] }
         return Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
@@ -113,22 +139,36 @@ enum AudioResampler {
 }
 
 /// Owned by the audio tap thread after `prepare`. Never install a converter on the tap.
+///
+/// `convert` returns a **reused** buffer. Anything that keeps the result past the call must copy
+/// it, or use `convertOwned`.
 nonisolated final class StreamingResampler: @unchecked Sendable {
-    private let outputFormat = AudioResampler.mono16kFormat()
+    private let outputFormat: AVAudioFormat
     private var converter: AVAudioConverter?
     private var inputFormat: AVAudioFormat?
     private var outputBuffer: AVAudioPCMBuffer?
     private var inputConsumed = false
+
+    init(outputFormat: AVAudioFormat = AudioResampler.mono16kFormat()) {
+        self.outputFormat = outputFormat
+    }
 
     /// Call only while the engine is idle (before `start`, after `stop`).
     func prepare(inputFormat: AVAudioFormat) {
         installConverter(from: inputFormat)
     }
 
+    /// Like `convert`, but the result is a fresh buffer the caller owns. Use this when the
+    /// audio is handed to an async consumer, such as `SpeechAnalyzer`'s input sequence.
+    func convertOwned(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let shared = convert(buffer) else { return nil }
+        return AudioResampler.copy(shared)
+    }
+
     func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         if buffer.format.sampleRate == outputFormat.sampleRate,
-           buffer.format.channelCount == 1,
-           buffer.format.commonFormat == .pcmFormatFloat32 {
+           buffer.format.channelCount == outputFormat.channelCount,
+           buffer.format.commonFormat == outputFormat.commonFormat {
             return buffer
         }
 

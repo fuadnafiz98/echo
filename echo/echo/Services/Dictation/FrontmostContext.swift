@@ -96,6 +96,9 @@ enum FrontmostContext {
     nonisolated private static func focusedWindow(pid: pid_t?) -> (title: String, documentURL: URL?) {
         guard let pid, AXIsProcessTrusted() else { return ("", nil) }
         let app = AXUIElementCreateApplication(pid)
+        // The default AX messaging timeout is several seconds. A wedged frontmost app should not
+        // be able to hold this thread for that long while a take is in flight.
+        AXUIElementSetMessagingTimeout(app, 0.25)
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focused) == .success,
               let window = focused

@@ -2,13 +2,19 @@ import AVFoundation
 import WhisperKit
 import os
 
-nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioConsumer, @unchecked Sendable {
+nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioConsumer,
+                                            StreamingAudioConsumer, @unchecked Sendable {
     private let variant: WhisperVariant
     private let session = OSAllocatedUnfairLock(initialState: SessionState())
     private var partialContinuation: AsyncStream<String>.Continuation?
+    private let pipelineLock = NSLock()
+    private var pipeline: AudioChunkPipeline?
 
-    private struct SessionState: Sendable {
-        var samples: [Float] = []
+    /// One model window. Decoding 30 s at a time also lets every window skip timestamps.
+    private static let windowSeconds: Double = 30
+
+    private struct SessionState: @unchecked Sendable {
+        var capture: AudioCaptureSnapshot?
         var vocabularyHints: [String] = []
     }
 
@@ -103,33 +109,102 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
 
     func startStreaming() async throws {
         let hints = session.withLock {
-            $0.samples = []
+            $0.capture = nil
             return $0.vocabularyHints
         }
 
         guard let folder = LocalModelPresence.folder(for: .whisper(variant)) else {
             throw TranscriptionError.modelNotDownloaded
         }
+
+        // The pipeline is installed *before* the model load is awaited. The microphone is already
+        // running by the time this is called, and loading a cold Whisper model takes seconds — if
+        // the pipeline only appeared afterwards, every one of those seconds of speech would be
+        // silently dropped from the streamed transcript.
+        let variant = variant
+        let session = session
+        let pipeline = AudioChunkPipeline(windowSeconds: Self.windowSeconds) { chunk, _ in
+            let loaded = try await Self.loadCached(variant: variant, folder: folder)
+            // Hints can land after `startStreaming` (the frontmost-app scan is async), so read
+            // the current set per window rather than capturing it once.
+            let live = session.withLock { $0.vocabularyHints }
+            let prompt = Self.cachedPromptTokens(variant: variant, hints: live)
+            let options = Self.hotPathOptions(promptTokens: prompt, sampleCount: chunk.count)
+            let results = try await loaded.kit.transcribe(audioArray: chunk, decodeOptions: options)
+            return results.map(\.text).joined(separator: " ")
+        }
+        pipelineLock.lock()
+        self.pipeline = pipeline
+        pipelineLock.unlock()
+
         let loaded = try await Self.loadCached(variant: variant, folder: folder)
         await Self.waitForWarm(loaded)
         encodePromptIfKitReady(hints)
     }
 
-    func consumeSamples(_ samples: [Float]) {
-        session.withLock { $0.samples = samples }
+    func cancelStreaming() async {
+        pipelineLock.lock()
+        let pipeline = self.pipeline
+        self.pipeline = nil
+        pipelineLock.unlock()
+        pipeline?.cancel()
+        partialContinuation?.finish()
+        partialContinuation = nil
+    }
+
+    func consumeStreamingBuffer(_ buffer: AVAudioPCMBuffer) {
+        pipelineLock.lock()
+        let pipeline = self.pipeline
+        pipelineLock.unlock()
+        pipeline?.append(AudioResampler.floats(from: buffer))
+    }
+
+    func consumeCapture(_ capture: AudioCaptureSnapshot) {
+        session.withLock { $0.capture = capture }
     }
 
     func stopStreaming() async throws -> String {
         defer {
             partialContinuation?.finish()
             partialContinuation = nil
+            pipelineLock.lock()
+            pipeline = nil
+            pipelineLock.unlock()
         }
 
-        let (audio, hints) = session.withLock { state in
-            let take = (state.samples, state.vocabularyHints)
-            state.samples = []
+        let (capture, hints) = session.withLock { state in
+            let take = (state.capture, state.vocabularyHints)
+            state.capture = nil
             return take
         }
+        let capturedFrames = capture?.capturedFrames ?? 0
+
+        pipelineLock.lock()
+        let pipeline = self.pipeline
+        pipelineLock.unlock()
+
+        // Fast path: windows were decoded while the user was still talking.
+        //
+        // Only trusted if the pipeline actually saw the whole take. If audio went missing — the
+        // handler was hooked late, or a window was dropped — fall back rather than paste a
+        // transcript that is quietly missing its opening.
+        if let pipeline, pipeline.frameCount > 0, pipeline.sawAtLeast(frames: capturedFrames) {
+            if let streamed = try? await pipeline.finish() {
+                let text = streamed.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    partialContinuation?.yield(text)
+                    return text
+                }
+            } else {
+                Latency.note("whisper chunked path failed — retranscribing the whole take")
+            }
+        } else if let pipeline, pipeline.frameCount > 0 {
+            Latency.note("whisper chunked path saw only part of the take — retranscribing")
+            pipeline.cancel()
+        }
+
+        // Only now, if the streamed path did not serve, is the recording decoded.
+        let audio = capture?.resolvedSamples() ?? []
         guard !audio.isEmpty else { return "" }
 
         let loaded = try await Self.loadCached(variant: variant, folder: try Self.requiredFolder(variant))

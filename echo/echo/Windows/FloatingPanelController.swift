@@ -29,9 +29,21 @@ final class FloatingPanelController {
         guard let panel else { return }
 
         positionPanel(panel)
+        applyBackdropTone()
         panel.alphaValue = 1
         panel.orderFront(nil)
         startObserving(appState)
+    }
+
+    /// Picks the wave tone from the system appearance.
+    ///
+    /// Echo never looks at the screen, so it cannot know what is actually behind the chip. The
+    /// system appearance is the best available proxy: in Dark Mode the page behind is very likely
+    /// dark. The wave carries a contrasting halo either way, so the occasional mismatch stays
+    /// readable rather than disappearing.
+    private func applyBackdropTone() {
+        let match = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+        chipView?.backdropIsDark = match == .darkAqua
     }
 
     func hide() {

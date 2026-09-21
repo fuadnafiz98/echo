@@ -43,6 +43,12 @@ struct StatsSettingsPane: View {
                     Text("Stop to transcript")
                 }
                 LabeledContent {
+                    Text(speechToTextLabel(snapshot.averagePasteMilliseconds))
+                } label: {
+                    Text("Average to paste")
+                    Text("Stop to text on screen")
+                }
+                LabeledContent {
                     Text(speechToTextLabel(lastSTT.map(Double.init)))
                 } label: {
                     Text("Last take")

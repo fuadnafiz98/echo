@@ -22,6 +22,32 @@ struct HotPathInvariantTests {
         #expect(!stop.contains("polish("))
     }
 
+    /// The overlay must be on screen before the microphone is asked to start. `engine.start()` is
+    /// a CoreAudio device start and can take hundreds of milliseconds on a cold device.
+    @Test func startRecordingShowsOverlayBeforeStartingCapture() throws {
+        let source = try AppSource.load("EchoCoordinator.swift")
+        let start = try #require(AppSource.method(source, named: "startRecording"))
+        #expect(
+            AppSource.appearsInOrder(start, [
+                "appState.phase = .recording",
+                "panelController.show",
+                "audioEngine.beginCapture",
+            ]),
+            "startRecording must show the chip before starting capture. Got:\n\(start)"
+        )
+        // Capture is awaited, never run synchronously on the hotkey's thread.
+        #expect(start.contains("try await audioEngine.beginCapture"))
+    }
+
+    /// Nothing on the hotkey path may block on the disk.
+    @Test func beginSessionNeverBlocksOnIO() throws {
+        let source = try AppSource.load("Services/Audio/AudioSampleCollector.swift")
+        let begin = try #require(AppSource.method(source, named: "beginSession"))
+        #expect(!begin.contains("ioQueue.sync"))
+        #expect(!begin.contains("contentsOfDirectory"))
+        #expect(begin.contains("ioQueue.async"))
+    }
+
     @Test func startRecordingDoesNotDownloadOrWalkDisk() throws {
         let source = try AppSource.load("EchoCoordinator.swift")
         let start = try #require(AppSource.method(source, named: "startRecording"))
@@ -92,7 +118,7 @@ struct HotPathInvariantTests {
 
     @Test func audioTapDoesNotSampleStats() throws {
         let source = try AppSource.load("Services/AudioEngineService.swift")
-        let tap = try #require(AppSource.method(source, named: "installTapIfNeeded"))
+        let tap = try #require(AppSource.method(source, named: "installTapLocked"))
         #expect(!tap.contains("UsageStats"))
         #expect(!tap.contains("ResourceStats"))
         #expect(!tap.contains("task_info"))
@@ -107,6 +133,18 @@ struct HotPathInvariantTests {
         #expect(!show.contains("ResourceStats"))
         #expect(!show.contains("task_info"))
         #expect(!show.contains("host_processor"))
+    }
+
+    /// Reading the old clipboard can be slow when it holds an image, and it used to happen
+    /// inside `paste`, i.e. between the transcript being ready and the text landing.
+    @Test func clipboardIsSnapshotDuringTheTakeNotAtPaste() throws {
+        let source = try AppSource.load("EchoCoordinator.swift")
+        let start = try #require(AppSource.method(source, named: "startRecording"))
+        #expect(start.contains("PasteService.snapshotClipboard()"))
+
+        let deliver = try #require(AppSource.method(source, named: "deliver"))
+        #expect(deliver.contains("previousClipboard: pendingClipboard"))
+        #expect(!deliver.contains("snapshotClipboard"))
     }
 
     @Test func presenceAndLibraryNeverListDirectories() throws {

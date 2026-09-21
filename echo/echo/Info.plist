@@ -2,5 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Echo is an accessory app with no windows, so App Nap would otherwise throttle it
+	     after a few idle minutes and the first hotkey press after lunch takes ~a second. -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
 </dict>
 </plist>

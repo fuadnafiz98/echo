@@ -149,16 +149,21 @@ struct HotPathStatsIsolationTests {
         }
     }
 
-    @Test func startRecordingIsMicAndChipBeforeModelLoad() throws {
+    /// Chip first, then the microphone, then the model.
+    ///
+    /// This used to require `beginCapture` before `panelController.show`. That is what made the
+    /// overlay wait on a CoreAudio device start, so the order is deliberately inverted now. What
+    /// still matters is that both come before the model prepare.
+    @Test func startRecordingIsChipThenMicBeforeModelLoad() throws {
         let source = try AppSource.load("EchoCoordinator.swift")
         let start = try #require(AppSource.method(source, named: "startRecording"))
         #expect(
             AppSource.appearsInOrder(start, [
-                "beginCapture",
                 "panelController.show",
+                "beginCapture",
                 "transcriptionService.prepare",
             ]),
-            "hotkey → listening must start mic+chip before model prepare. Got:\n\(start)"
+            "hotkey → listening must show the chip, then start the mic, then prepare. Got:\n\(start)"
         )
         assertNoSTTRecord(start, path: "startRecording")
         assertNoSampleWork(start, path: "startRecording")

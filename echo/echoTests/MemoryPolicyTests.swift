@@ -73,11 +73,40 @@ struct MemoryPolicyTests {
         #expect(!settings.contains("TranscriptCleaner.shared.prewarm()"))
     }
 
-    @Test func idleUnloadIsTenMinutesAndSkipsBusyTakes() throws {
+    @Test func idleUnloadIsPressureDrivenWithLongBackstopAndSkipsBusyTakes() throws {
         let source = try AppSource.load("Services/Models/ResidentEnginePolicy.swift")
-        #expect(source.contains("idleUnloadAfter: Duration = .seconds(10 * 60)"))
+        #expect(source.contains("idleUnloadAfter: Duration = .seconds(2 * 60 * 60)"))
+        #expect(source.contains("makeMemoryPressureSource"))
         let schedule = try #require(AppSource.method(source, named: "scheduleIdleUnload"))
+        #expect(schedule.contains("startMemoryPressureWatch()"))
         #expect(schedule.contains("phase != .idle"))
-        #expect(schedule.contains("evictAllSpeech()"))
+        #expect(schedule.contains("evictLargeGraphs()"))
+    }
+
+    /// Apple's analyzer is tens of megabytes and reloading it is the single biggest source of a
+    /// slow first take. It must survive every idle path and only go on quit.
+    @Test func idleEvictionKeepsAppleSpeechResident() throws {
+        let source = try AppSource.load("Services/Models/ResidentEnginePolicy.swift")
+        let large = try #require(AppSource.method(source, named: "evictLargeGraphs"))
+        #expect(large.contains("WhisperKitProvider.evict()"))
+        #expect(large.contains("ParakeetProvider.evict()"))
+        #expect(!large.contains("AppleSTTProvider.evict()"))
+
+        let inactive = try #require(AppSource.method(source, named: "evictInactive"))
+        #expect(!inactive.contains("AppleSTTProvider.evict()"))
+
+        let everything = try #require(AppSource.method(source, named: "evictEverything"))
+        #expect(everything.contains("AppleSTTProvider.evict()"))
+
+        // Quit is the only caller allowed to drop it.
+        let coordinator = try AppSource.load("EchoCoordinator.swift")
+        let stop = try #require(AppSource.method(coordinator, named: "stop"))
+        #expect(stop.contains("ResidentEnginePolicy.evictEverything()"))
+    }
+
+    @Test func appleAnalyzerIsBuiltWithProcessLifetimeRetention() throws {
+        let source = try AppSource.load("Services/Transcription/AppleSTTProvider.swift")
+        #expect(source.contains("modelRetention: .processLifetime"))
+        #expect(source.contains("SpeechAnalyzer(modules: [transcriber], options: analyzerOptions)"))
     }
 }

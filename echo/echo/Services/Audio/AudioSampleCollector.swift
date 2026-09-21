@@ -6,16 +6,36 @@ import os
 struct AudioCaptureSnapshot: Sendable {
     var samples: [Float]
     var fileURL: URL?
+    /// Total frames captured this take.
+    ///
+    /// Not derivable from `samples`: the Apple path writes straight to the CAF and deliberately
+    /// returns no samples, so counting them would report every take as zero seconds long.
+    var capturedFrames: Int = 0
+
+    var seconds: Double {
+        Double(capturedFrames) / AudioResampler.targetSampleRate
+    }
+
+    /// Samples for the take, reading the spilled recording only if it is actually needed.
+    ///
+    /// Takes over 90 seconds spill to disk. Decoding that file back is linear in the length of the
+    /// recording, so doing it eagerly at stop reintroduced exactly the cost this change removes —
+    /// on a path that usually only feeds a fallback that never runs.
+    func resolvedSamples() -> [Float] {
+        if !samples.isEmpty { return samples }
+        guard let fileURL else { return [] }
+        return AudioSampleCollector.readFloats(from: fileURL)
+    }
 
     func trimmingSilence(padSeconds: Double = 0.15) -> AudioCaptureSnapshot {
         guard !samples.isEmpty, let trimmed = AudioSampleCollector.trimmed(samples, padSeconds: padSeconds) else {
             return self
         }
-        return AudioCaptureSnapshot(samples: trimmed, fileURL: fileURL)
+        return AudioCaptureSnapshot(samples: trimmed, fileURL: fileURL, capturedFrames: capturedFrames)
     }
 }
 
-private final class HandlerBox: @unchecked Sendable {
+nonisolated private final class HandlerBox: @unchecked Sendable {
     var handler: ((AVAudioPCMBuffer) -> Void)?
 }
 
@@ -40,6 +60,7 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
     private let ringFrames: Int
     private let ringState = OSAllocatedUnfairLock(initialState: RingState())
     private let liveHandler = OSAllocatedUnfairLock<HandlerBox>(initialState: HandlerBox())
+    private let drainedHandler = OSAllocatedUnfairLock<HandlerBox>(initialState: HandlerBox())
     private let drainSemaphore = DispatchSemaphore(value: 0)
     private let ioQueue = DispatchQueue(label: "echo.audio.sink", qos: .userInitiated)
     private let stopConsumer = OSAllocatedUnfairLock(initialState: false)
@@ -50,6 +71,8 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
     private var keepSamples = true
     private var spilled = false
     private var drainBuffer: AVAudioPCMBuffer?
+    /// Frames ingested this session. `ioQueue`-confined.
+    private var ingestedFrames = 0
 
     var isCapturing: Bool {
         ringState.withLock { $0.capturing }
@@ -73,41 +96,56 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
         ring.deallocate()
     }
 
+    /// Never blocks the caller. The hotkey path runs this on the main thread, so the file
+    /// creation and buffer allocation go to `ioQueue` and `capturing` is flipped there —
+    /// no frame can be accepted before the sink is ready, and main never waits on the disk.
     func beginSession(keepSamplesInMemory: Bool = true) {
-        ringState.withLock { state in
+        let generation = ringState.withLock { state -> UInt64 in
             state.generation &+= 1
             state.capturing = false
             state.writeIndex = 0
             state.count = 0
+            return state.generation
         }
-        ioQueue.sync {
-            #if DEBUG
-            Self.auditTemporaryRecordings(context: "begin", keeping: nil)
-            #endif
-            samples.removeAll(keepingCapacity: true)
-            spilled = false
-            keepSamples = keepSamplesInMemory
-            closeWriter()
-            if let fileURL {
+        ioQueue.async {
+            guard self.ringState.withLock({ $0.generation }) == generation else { return }
+            self.samples.removeAll(keepingCapacity: true)
+            self.spilled = false
+            self.ingestedFrames = 0
+            self.keepSamples = keepSamplesInMemory
+            self.closeWriter()
+            if let fileURL = self.fileURL {
                 try? FileManager.default.removeItem(at: fileURL)
             }
-            fileURL = nil
-            drainBuffer = AVAudioPCMBuffer(
-                pcmFormat: AudioResampler.mono16kFormat(),
-                frameCapacity: AVAudioFrameCount(Self.drainChunk)
-            )
+            self.fileURL = nil
+            if self.drainBuffer == nil {
+                self.drainBuffer = AVAudioPCMBuffer(
+                    pcmFormat: AudioResampler.mono16kFormat(),
+                    frameCapacity: AVAudioFrameCount(Self.drainChunk)
+                )
+            }
             if !keepSamplesInMemory {
-                openFile()
-                if audioFile == nil {
-                    keepSamples = true
+                self.openFile()
+                if self.audioFile == nil {
+                    self.keepSamples = true
                 }
             }
+            // Only now is it safe to accept frames.
+            self.ringState.withLock { state in
+                guard state.generation == generation else { return }
+                state.capturing = true
+            }
+            self.drainSemaphore.signal()
         }
-        ringState.withLock { $0.capturing = true }
     }
 
     func endSession() async -> AudioCaptureSnapshot {
-        ringState.withLock { $0.capturing = false }
+        // Bump the generation so a `beginSession` block still sitting on `ioQueue` cannot come
+        // along afterwards and re-arm capture for a take that has already ended.
+        ringState.withLock { state in
+            state.capturing = false
+            state.generation &+= 1
+        }
         drainSemaphore.signal()
         return await withCheckedContinuation { continuation in
             ioQueue.async {
@@ -120,6 +158,15 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
 
     func setLiveHandler(_ handler: ((AVAudioPCMBuffer) -> Void)?) {
         liveHandler.withLock { $0.handler = handler }
+    }
+
+    /// Streaming engines consume here, not on the tap.
+    ///
+    /// The tap hands back `StreamingResampler`'s single reused output buffer, so anything that
+    /// keeps a reference would read torn audio. This fires on `ioQueue` once per drained chunk
+    /// (~256 ms of 16 kHz mono) with a **freshly allocated** buffer the consumer owns.
+    func setDrainedHandler(_ handler: ((AVAudioPCMBuffer) -> Void)?) {
+        drainedHandler.withLock { $0.handler = handler }
     }
 
     func append(converted buffer: AVAudioPCMBuffer) {
@@ -218,18 +265,17 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
                     return
                 }
                 self.liveHandler.withLock { $0.handler = nil }
+                self.drainedHandler.withLock { $0.handler = nil }
                 self.flushWork()
                 self.closeWriter()
                 self.samples.removeAll(keepingCapacity: false)
                 self.drainBuffer = nil
                 self.spilled = false
+                self.ingestedFrames = 0
                 if let fileURL = self.fileURL {
                     try? FileManager.default.removeItem(at: fileURL)
                 }
                 self.fileURL = nil
-                #if DEBUG
-                Self.auditTemporaryRecordings(context: "reset", keeping: nil)
-                #endif
                 continuation.resume()
             }
         }
@@ -262,6 +308,18 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
     private func ingestDrainedFrames(_ count: Int) {
         guard count > 0, let drainBuffer, let dest = drainBuffer.floatChannelData?[0] else { return }
         drainBuffer.frameLength = AVAudioFrameCount(count)
+        ingestedFrames += count
+
+        if let handler = drainedHandler.withLock({ $0.handler }),
+           let owned = AVAudioPCMBuffer(
+               pcmFormat: AudioResampler.mono16kFormat(),
+               frameCapacity: AVAudioFrameCount(count)
+           ),
+           let ownedChannel = owned.floatChannelData?[0] {
+            owned.frameLength = AVAudioFrameCount(count)
+            ownedChannel.update(from: dest, count: count)
+            handler(owned)
+        }
 
         if keepSamples, !spilled {
             samples.append(contentsOf: UnsafeBufferPointer(start: dest, count: count))
@@ -349,21 +407,19 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
 
     /// RAM path returns in-memory floats. File-only Apple capture returns the URL and skips a CAF read.
     /// Spilled Parakeet/Whisper (>90s) reads the file so the take is not lost.
+    /// Never decodes the recording here. Callers that genuinely need samples ask for them with
+    /// ``AudioCaptureSnapshot/resolvedSamples()``, which keeps the file read off the stop path.
     private func makeSnapshot() -> AudioCaptureSnapshot {
+        let frames = ingestedFrames
         if keepSamples, !spilled {
-            return AudioCaptureSnapshot(samples: samples, fileURL: fileURL)
+            return AudioCaptureSnapshot(samples: samples, fileURL: fileURL, capturedFrames: frames)
         }
-        if keepSamples || spilled || fileURL == nil {
-            if let fileURL {
-                return AudioCaptureSnapshot(samples: Self.readFloats(from: fileURL), fileURL: fileURL)
-            }
-            return AudioCaptureSnapshot(samples: samples, fileURL: nil)
-        }
-        return AudioCaptureSnapshot(samples: [], fileURL: fileURL)
+        return AudioCaptureSnapshot(samples: [], fileURL: fileURL, capturedFrames: frames)
     }
 
-    #if DEBUG
-    private static func auditTemporaryRecordings(context: String, keeping keep: URL?) {
+    /// Launch-time only. This walks `$TMPDIR`, so it must never run from `beginSession` —
+    /// that put a synchronous directory enumeration on the hotkey path in debug builds.
+    static func pruneStaleTemporaryRecordings(olderThan age: TimeInterval = 3600) {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory
         guard let items = try? fm.contentsOfDirectory(
@@ -377,19 +433,14 @@ nonisolated final class AudioSampleCollector: @unchecked Sendable {
             guard name.hasPrefix("echo-"), url.pathExtension == "caf" || url.pathExtension == "wav" else {
                 continue
             }
-            if url == keep { continue }
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now
-            if now.timeIntervalSince(modified) > 3600 {
+            if now.timeIntervalSince(modified) > age {
                 try? fm.removeItem(at: url)
-                print("[Echo] removed stale temp audio (\(context)): \(name)")
-            } else {
-                print("[Echo] temp audio present (\(context)): \(name)")
             }
         }
     }
-    #endif
 
-    private static func readFloats(from url: URL) -> [Float] {
+    static func readFloats(from url: URL) -> [Float] {
         guard let file = try? AVAudioFile(forReading: url) else { return [] }
         let format = file.processingFormat
         guard format.channelCount == 1, let buffer = AVAudioPCMBuffer(

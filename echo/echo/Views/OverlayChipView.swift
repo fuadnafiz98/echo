@@ -13,8 +13,12 @@ final class OverlayChipView: NSView {
         }
     }
 
-    /// White waves on a dark page, black waves on a light page.
-    var backdropIsDark = true {
+    /// Inverts the wave for a dark plate.
+    ///
+    /// Defaults to `false` because the host `NSGlassEffectView` is pinned to the light `.aqua`
+    /// recipe. This used to default to `true` and nothing ever assigned it, so the wave was drawn
+    /// white on a light plate and simply disappeared on a white page.
+    var backdropIsDark = false {
         didSet {
             guard oldValue != backdropIsDark else { return }
             appearance = NSAppearance(named: backdropIsDark ? .darkAqua : .aqua)
@@ -52,7 +56,8 @@ final class OverlayChipView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = false
-        appearance = NSAppearance(named: .darkAqua)
+        // Match the glass host, which is a light HUD recipe.
+        appearance = NSAppearance(named: .aqua)
 
         spinner.style = .spinning
         spinner.controlSize = .small
@@ -95,16 +100,21 @@ final class OverlayChipView: NSView {
         let idle: CGFloat = 1.4
         let travel = max(inset.height - idle, 0)
 
+        // Dark ink on the light glass plate, with a bright halo behind it.
+        //
+        // The glass is `.clear`, so a dark page shows through and the plate darkens. The halo is
+        // what keeps the wave readable in that case — without it the bars vanish into whichever
+        // page happens to be behind them.
         let fill = backdropIsDark
             ? NSColor.white.withAlphaComponent(0.96)
-            : NSColor.black.withAlphaComponent(0.92)
+            : NSColor.black.withAlphaComponent(0.78)
         let halo = backdropIsDark
-            ? NSColor.black.withAlphaComponent(0.42)
-            : NSColor.white.withAlphaComponent(0.38)
+            ? NSColor.black.withAlphaComponent(0.45)
+            : NSColor.white.withAlphaComponent(0.9)
 
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 1.6, color: halo.cgColor)
+        ctx.setShadow(offset: .zero, blur: 2.4, color: halo.cgColor)
         fill.setFill()
 
         for index in 0..<count {
