@@ -1,16 +1,22 @@
 import AVFoundation
 import Accelerate
+import CoreAudio
 import os
 
-/// Owns `AVAudioEngine`. Every engine call runs on one serial queue, never on the main thread.
+/// Input-only microphone capture on a CoreAudio IOProc.
 ///
-/// `engine.start()` is a CoreAudio device start: tens of milliseconds warm, and far worse when
-/// `coreaudiod` has idled the device or the input is Bluetooth. Doing that synchronously from the
-/// hotkey handler is what made the overlay appear late. The queue is serial, so a stop enqueued
-/// while a start is still running is still ordered correctly.
+/// Not `AVAudioEngine`: the engine always runs an output unit on the default output device,
+/// which is usually the headphones the user is listening on, and it follows the default input
+/// even when that is a Bluetooth headset. Either of those can change what the user hears.
+/// An IOProc on the chosen input device opens that device only, and `AudioInputDevices`
+/// keeps it off Bluetooth headsets whenever there is another mic.
+///
+/// Control calls run on one serial queue, never on the main thread. A cold device start can
+/// take tens of milliseconds, and doing that from the hotkey handler made the overlay late.
 nonisolated final class AudioGraph: @unchecked Sendable {
-    private let engine = AVAudioEngine()
     private let queue = DispatchQueue(label: "echo.audio.graph", qos: .userInitiated)
+    /// Buffers leave the HAL IO thread right away and are resampled and metered here.
+    private let processQueue = DispatchQueue(label: "echo.audio.process", qos: .userInteractive)
     private let collector: AudioSampleCollector
     private let resampler: StreamingResampler
     private let levelClock: LevelPublishClock
@@ -18,11 +24,12 @@ nonisolated final class AudioGraph: @unchecked Sendable {
     private let firstBufferAt = OSAllocatedUnfairLock(initialState: CFAbsoluteTime?.none)
 
     /// Queue-confined.
-    private var tapInstalled = false
-    private var tapFormat: AVAudioFormat?
-
-    /// Block-based observers are keyed by this token, not by `self`, so it has to be kept.
-    private let configurationObserver = OSAllocatedUnfairLock(initialState: NSObjectProtocol?.none)
+    private var device: AudioInputDevices.Device?
+    private var ioProcID: AudioDeviceIOProcID?
+    private var running = false
+    private var resamplerRate: Double = 0
+    private var deviceListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    private var systemListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
 
     init(
         collector: AudioSampleCollector,
@@ -35,49 +42,38 @@ nonisolated final class AudioGraph: @unchecked Sendable {
         self.levelClock = levelClock
         self.rmsScratch = rmsScratch
 
-        let observer = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleConfigurationChange()
+        queue.async {
+            // Default input swaps and devices coming or going (AirPods connecting, a USB mic
+            // unplugged) can change which mic echo should use.
+            self.systemListeners = self.addListeners(
+                on: AudioObjectID(kAudioObjectSystemObject),
+                selectors: [kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices]
+            )
         }
-        configurationObserver.withLock { $0 = observer }
     }
 
     deinit {
-        if let observer = configurationObserver.withLock({ $0 }) {
-            NotificationCenter.default.removeObserver(observer)
+        for (address, block) in systemListeners {
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
         }
     }
 
-    /// Fire-and-forget graph warm. Safe to call repeatedly (launch, wake, device change).
+    /// Fire-and-forget warm: picks the device and registers the IOProc without starting IO.
+    /// Safe to call repeatedly (launch, wake, device change).
     func prepare() {
         queue.async {
-            try? self.installTapLocked()
-            self.prepareResamplerLocked()
-            if !self.engine.isRunning {
-                self.engine.prepare()
-            }
+            try? self.configureLocked(warmOnly: true)
         }
     }
 
-    /// Returns true if the CoreAudio device actually had to be started, false if it was already
-    /// running. Worth distinguishing: a cold start is the expensive case.
+    /// Returns true if the device actually had to be started, false if it was already running.
     @discardableResult
     func start() async throws -> Bool {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
             queue.async {
                 do {
-                    try self.installTapLocked()
-                    if self.engine.isRunning {
-                        continuation.resume(returning: false)
-                        return
-                    }
-                    self.prepareResamplerLocked()
-                    self.engine.prepare()
-                    try self.engine.start()
-                    continuation.resume(returning: true)
+                    continuation.resume(returning: try self.startLocked())
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -89,8 +85,11 @@ nonisolated final class AudioGraph: @unchecked Sendable {
     func stop() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async {
-                if self.engine.isRunning {
-                    self.engine.stop()
+                self.stopLocked()
+                // A headset mic is only used when it is the sole input. Unregister it so
+                // nothing holds it between takes.
+                if self.device?.isBluetooth == true {
+                    self.releaseDeviceLocked()
                 }
                 continuation.resume()
             }
@@ -99,44 +98,18 @@ nonisolated final class AudioGraph: @unchecked Sendable {
 
     func teardown() {
         queue.sync {
-            if tapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
-                tapInstalled = false
-            }
-            if engine.isRunning {
-                engine.stop()
-            }
-            engine.reset()
-            resampler.reset()
-            tapFormat = nil
+            stopLocked()
+            releaseDeviceLocked()
         }
     }
 
-    /// Reinstalls the tap against the current hardware format.
+    /// Re-picks the device and re-reads its format after sleep or a route change.
     ///
-    /// Without this, waking from sleep or connecting headphones leaves a tap bound to a stale
-    /// format: the converter rejects every buffer and the take comes back empty.
+    /// Without this, a sample-rate change leaves the resampler set up for the old format, it
+    /// rejects every buffer, and the take comes back empty.
     func refresh() {
         queue.async {
-            // By the time this notification arrives the engine has usually stopped itself, so
-            // `isRunning` is already false mid-take. Ask the sink whether a take is in flight,
-            // otherwise a device change silently kills the rest of the recording.
-            let wasRunning = self.engine.isRunning || self.collector.isCapturing
-            if self.engine.isRunning {
-                self.engine.stop()
-            }
-            if self.tapInstalled {
-                self.engine.inputNode.removeTap(onBus: 0)
-                self.tapInstalled = false
-            }
-            self.resampler.reset()
-            self.tapFormat = nil
-            try? self.installTapLocked()
-            self.prepareResamplerLocked()
-            self.engine.prepare()
-            if wasRunning {
-                try? self.engine.start()
-            }
+            self.refreshLocked()
         }
     }
 
@@ -145,71 +118,216 @@ nonisolated final class AudioGraph: @unchecked Sendable {
     }
 
     /// Milliseconds from `reference` to the first captured buffer, once one has arrived.
-    /// Read after the take; the audio thread only stores a timestamp.
+    /// Read after the take; the IO thread only stores a timestamp.
     func firstBufferDelay(since reference: CFAbsoluteTime) -> Double? {
         guard let stamp = firstBufferAt.withLock({ $0 }) else { return nil }
         return (stamp - reference) * 1000
     }
 
-    private func handleConfigurationChange() {
-        Latency.note("audio configuration changed — reinstalling tap")
-        refresh()
-    }
-
     // MARK: - Queue-confined
 
-    private func prepareResamplerLocked() {
-        guard !engine.isRunning else { return }
-        let format = tapFormat ?? engine.inputNode.outputFormat(forBus: 0)
-        guard format.channelCount > 0, format.sampleRate > 0 else { return }
-        resampler.prepare(inputFormat: format)
+    private func refreshLocked() {
+        // Ask the sink too: a device that vanished mid-take may already have stopped itself.
+        let wasRunning = running || collector.isCapturing
+        stopLocked()
+        releaseDeviceLocked()
+        if wasRunning {
+            do {
+                _ = try startLocked()
+            } catch {
+                Latency.note("capture restart after device change failed: \(error.localizedDescription)")
+            }
+        } else {
+            try? configureLocked(warmOnly: true)
+        }
     }
 
-    private func installTapLocked() throws {
-        if tapInstalled { return }
-
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        guard format.channelCount > 0, format.sampleRate > 0 else {
+    private func startLocked() throws -> Bool {
+        try configureLocked(warmOnly: false)
+        guard let device, let ioProcID else { throw Self.micUnavailable }
+        if running { return false }
+        let status = AudioDeviceStart(device.id, ioProcID)
+        guard status == noErr else {
             throw NSError(
-                domain: "EchoAudio",
-                code: 1,
-                userInfo: [
-                    NSLocalizedDescriptionKey: "Microphone isn’t available. Pick a mic in System Settings → Sound."
-                ]
+                domain: NSOSStatusErrorDomain,
+                code: Int(status),
+                userInfo: [NSLocalizedDescriptionKey: "Couldn’t start the microphone (\(status))."]
             )
         }
+        running = true
+        return true
+    }
 
+    private func stopLocked() {
+        guard running, let device, let ioProcID else {
+            running = false
+            return
+        }
+        AudioDeviceStop(device.id, ioProcID)
+        running = false
+    }
+
+    /// Makes sure an IOProc is registered on the right device with a matching resampler.
+    /// `warmOnly` skips Bluetooth devices: touching a headset outside a take is what flips it
+    /// into its call profile.
+    private func configureLocked(warmOnly: Bool) throws {
+        guard let target = AudioInputDevices.captureDevice() else { throw Self.micUnavailable }
+        if target == device, ioProcID != nil { return }
+        if warmOnly, target.isBluetooth { return }
+
+        stopLocked()
+        releaseDeviceLocked()
+
+        guard let stream = AudioInputDevices.inputStreamFormat(target.id),
+              stream.mFormatID == kAudioFormatLinearPCM,
+              stream.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              stream.mBitsPerChannel == 32,
+              stream.mSampleRate > 0,
+              let format = AVAudioFormat(standardFormatWithSampleRate: stream.mSampleRate, channels: 1)
+        else { throw Self.micUnavailable }
+
+        processQueue.sync {
+            resampler.prepare(inputFormat: format)
+        }
+
+        var procID: AudioDeviceIOProcID?
+        let block = makeIOBlock(format: format)
+        let status = AudioDeviceCreateIOProcIDWithBlock(&procID, target.id, nil, block)
+        guard status == noErr, let procID else { throw Self.micUnavailable }
+
+        ioProcID = procID
+        device = target
+        // Sample-rate or stream changes on the device itself, and the device disappearing.
+        deviceListeners = addListeners(
+            on: target.id,
+            selectors: [
+                kAudioDevicePropertyNominalSampleRate,
+                kAudioDevicePropertyStreamConfiguration,
+                kAudioDevicePropertyDeviceIsAlive,
+            ]
+        )
+        Latency.note(
+            "capture device: \(target.name) @ \(Int(stream.mSampleRate)) Hz\(target.isBluetooth ? " (Bluetooth, no other mic)" : "")"
+        )
+    }
+
+    private func releaseDeviceLocked() {
+        if let device {
+            for (address, block) in deviceListeners {
+                var address = address
+                AudioObjectRemovePropertyListenerBlock(device.id, &address, queue, block)
+            }
+            if let ioProcID {
+                AudioDeviceDestroyIOProcID(device.id, ioProcID)
+            }
+        }
+        deviceListeners = []
+        ioProcID = nil
+        device = nil
+        running = false
+    }
+
+    private func addListeners(
+        on object: AudioObjectID,
+        selectors: [AudioObjectPropertySelector]
+    ) -> [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] {
+        selectors.compactMap { selector in
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.handleDeviceChangeLocked()
+            }
+            guard AudioObjectAddPropertyListenerBlock(object, &address, queue, block) == noErr else { return nil }
+            return (address, block)
+        }
+    }
+
+    /// Listener blocks are delivered on `queue`.
+    private func handleDeviceChangeLocked() {
+        let wanted = AudioInputDevices.captureDevice()
+        // Device list churn that doesn't change the chosen mic (AirPods connecting while the
+        // built-in mic stays selected) needs nothing, and restarting would drop audio mid-take.
+        if let wanted, wanted == device,
+           let stream = AudioInputDevices.inputStreamFormat(wanted.id),
+           stream.mSampleRate == resamplerRate {
+            return
+        }
+        Latency.note("audio device change — re-picking microphone")
+        refreshLocked()
+    }
+
+    /// Runs on the HAL IO thread. Copies channel 0 out and hands it to `processQueue`.
+    private func makeIOBlock(format: AVAudioFormat) -> AudioDeviceIOBlock {
+        resamplerRate = format.sampleRate
+        let process = processQueue
+        let handle = makeBufferHandler()
+        return { _, inputData, _, _, _ in
+            let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+            guard let first = buffers.first, let data = first.mData else { return }
+            let channels = Int(max(first.mNumberChannels, 1))
+            let frames = Int(first.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+            guard frames > 0,
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
+                  let destination = buffer.floatChannelData?[0]
+            else { return }
+
+            let source = data.assumingMemoryBound(to: Float.self)
+            if channels == 1 {
+                destination.update(from: source, count: frames)
+            } else {
+                var zero: Float = 0
+                vDSP_vsadd(source, vDSP_Stride(channels), &zero, destination, 1, vDSP_Length(frames))
+            }
+            buffer.frameLength = AVAudioFrameCount(frames)
+            // Fresh buffer, never touched again on this thread.
+            nonisolated(unsafe) let owned = buffer
+            process.async { handle(owned) }
+        }
+    }
+
+    private func makeBufferHandler() -> @Sendable (AVAudioPCMBuffer) -> Void {
         let sink = collector
         let resampler = resampler
         let clock = levelClock
         let scratch = rmsScratch
         let stamp = firstBufferAt
-        resampler.prepare(inputFormat: format)
-        tapFormat = format
-
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        let window = LevelWindow()
+        return { buffer in
             if let converted = resampler.convert(buffer) {
                 sink.append(converted: converted)
             }
 
-            guard sink.isCapturing else { return }
+            guard sink.isCapturing else {
+                window.reset()
+                return
+            }
 
             stamp.withLock { existing in
                 if existing == nil { existing = CFAbsoluteTimeGetCurrent() }
             }
 
-            let now = CFAbsoluteTimeGetCurrent()
-            guard now - clock.last >= 1.0 / 24.0 else { return }
-            clock.last = now
-            clock.store(AudioGraph.rmsEnergy(buffer: buffer, scratch: scratch))
+            // The wave scrolls one bar per published level, so the publish rate *is* the wave
+            // speed. The HAL delivers ~10 ms buffers; fold them into 100 ms windows, the cadence
+            // the overlay was tuned against.
+            guard let (rms, peak) = window.add(buffer, scratch: scratch) else { return }
+            clock.store(AudioGraph.level(rms: rms, peak: peak))
         }
-        tapInstalled = true
     }
 
-    nonisolated private static func rmsEnergy(buffer: AVAudioPCMBuffer, scratch: RMSScratch) -> Float {
+    private static let micUnavailable = NSError(
+        domain: "EchoAudio",
+        code: 1,
+        userInfo: [
+            NSLocalizedDescriptionKey: "Microphone isn’t available. Pick a mic in System Settings → Sound."
+        ]
+    )
+
+    nonisolated fileprivate static func measure(_ buffer: AVAudioPCMBuffer, scratch: RMSScratch) -> (rms: Float, peak: Float) {
         let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return 0 }
+        guard frameCount > 0 else { return (0, 0) }
 
         var rms: Float = 0
         var peak: Float = 0
@@ -225,15 +343,19 @@ nonisolated final class AudioGraph: @unchecked Sendable {
             vDSP_rmsqv(scratch.floats, 1, &rms, vDSP_Length(frames))
             vDSP_maxmgv(scratch.floats, 1, &peak, vDSP_Length(frames))
         } else {
-            return 0
+            return (0, 0)
         }
+        return (rms, peak)
+    }
 
+    nonisolated private static func level(rms: Float, peak: Float) -> Float {
         let mixed = max(rms * 10, peak * 1.4)
         let gated = max(mixed - 0.018, 0)
         let level = min(gated / 0.24, 1)
         return level < 0.01 ? 0 : pow(level, 1.18)
     }
 }
+
 
 @MainActor
 final class AudioEngineService {
@@ -330,6 +452,36 @@ final class AudioEngineService {
     }
 }
 
+/// Accumulates short HAL buffers into fixed-length level windows. Confined to the process queue.
+nonisolated final class LevelWindow: @unchecked Sendable {
+    static let duration: Double = 0.1
+
+    private var sumOfSquares: Float = 0
+    private var peak: Float = 0
+    private var frames = 0
+
+    /// Returns the window's RMS and peak once it has filled, otherwise nil.
+    func add(_ buffer: AVAudioPCMBuffer, scratch: RMSScratch) -> (Float, Float)? {
+        let count = Int(buffer.frameLength)
+        guard count > 0 else { return nil }
+        let stats = AudioGraph.measure(buffer, scratch: scratch)
+        sumOfSquares += stats.rms * stats.rms * Float(count)
+        peak = max(peak, stats.peak)
+        frames += count
+
+        guard Double(frames) >= buffer.format.sampleRate * Self.duration else { return nil }
+        let result = ((sumOfSquares / Float(frames)).squareRoot(), peak)
+        reset()
+        return result
+    }
+
+    func reset() {
+        sumOfSquares = 0
+        peak = 0
+        frames = 0
+    }
+}
+
 nonisolated final class RMSScratch: @unchecked Sendable {
     let floats: UnsafeMutablePointer<Float>
     let capacity: Int
@@ -347,17 +499,11 @@ nonisolated final class RMSScratch: @unchecked Sendable {
 
 nonisolated final class LevelPublishClock: @unchecked Sendable {
     private struct State {
-        var lastPublish: CFAbsoluteTime = 0
         var energy: Float = 0
         var pending = false
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
-
-    var last: CFAbsoluteTime {
-        get { state.withLock { $0.lastPublish } }
-        set { state.withLock { $0.lastPublish = newValue } }
-    }
 
     func store(_ value: Float) {
         state.withLock {
@@ -376,7 +522,6 @@ nonisolated final class LevelPublishClock: @unchecked Sendable {
 
     func reset() {
         state.withLock {
-            $0.lastPublish = 0
             $0.energy = 0
             $0.pending = false
         }

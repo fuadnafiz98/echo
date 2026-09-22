@@ -29,21 +29,9 @@ final class FloatingPanelController {
         guard let panel else { return }
 
         positionPanel(panel)
-        applyBackdropTone()
         panel.alphaValue = 1
         panel.orderFront(nil)
         startObserving(appState)
-    }
-
-    /// Picks the wave tone from the system appearance.
-    ///
-    /// Echo never looks at the screen, so it cannot know what is actually behind the chip. The
-    /// system appearance is the best available proxy: in Dark Mode the page behind is very likely
-    /// dark. The wave carries a contrasting halo either way, so the occasional mismatch stays
-    /// readable rather than disappearing.
-    private func applyBackdropTone() {
-        let match = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
-        chipView?.backdropIsDark = match == .darkAqua
     }
 
     func hide() {
@@ -91,8 +79,10 @@ final class FloatingPanelController {
         glass.style = .clear
         glass.cornerRadius = size.height / 2
         glass.tintColor = nil
-        // Light HUD recipe — darkAqua glass reads as a charcoal plate on dark pages.
-        glass.appearance = NSAppearance(named: .aqua)
+        // Dark HUD recipe, like the system volume/brightness chips. The light `.aqua` recipe
+        // lays a white scrim over whatever is behind it, which on a black page reads as a grey
+        // slab instead of glass.
+        glass.appearance = NSAppearance(named: .darkAqua)
         glass.contentView = chip
 
         panel.contentView = glass
