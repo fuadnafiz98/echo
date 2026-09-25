@@ -11,6 +11,7 @@ final class EchoCoordinator {
     private let audioEngine = AudioEngineService()
     private let transcriptionService = TranscriptionService()
     private let panelController = FloatingPanelController()
+    private let stopIntent = StopIntentMonitor()
     private var startTask: Task<Void, Error>?
     private var captureTask: Task<Void, Error>?
     private var sceneTask: Task<Void, Never>?
@@ -26,6 +27,8 @@ final class EchoCoordinator {
     private var takePressedAt: CFAbsoluteTime = 0
     /// Clipboard captured during the take, restored after the paste.
     private var pendingClipboard: ClipboardSnapshot = []
+    /// Bumped per take. A prepare that fails after its take ended must not abort the next one.
+    private var takeGeneration: UInt64 = 0
 
     func start() {
         let launchedAt = CFAbsoluteTimeGetCurrent()
@@ -72,13 +75,33 @@ final class EchoCoordinator {
         }
 
         UsageStats.startBackgroundFlush()
+        prewarmCleanup()
 
         #if DEBUG
         SpokenPathNormalizer.assertFixtureCases()
         #endif
     }
 
+    /// The first cleanup of a run compiles its rules and regexes: ~45 ms between transcript and
+    /// paste on the first take, ~4 ms after. Pay it once, after launch, instead.
+    private func prewarmCleanup() {
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            let settings = DictationSettings.shared
+            let sample = "um so the build is green again and I think we can ship it on Thursday"
+            _ = DictationCleanup.apply(
+                sample,
+                stripFillers: settings.stripFillers,
+                vocabulary: settings.vocabulary,
+                projectTerms: [],
+                userReplacements: settings.replacements
+            )
+            _ = UsageWords.count(sample)
+        }
+    }
+
     func stop() {
+        stopIntent.stop()
         sceneTask?.cancel()
         sceneTask = nil
         clipboardTask?.cancel()
@@ -180,6 +203,8 @@ final class EchoCoordinator {
         Latency.hotkeyToChip(Latency.milliseconds(since: pressedAt))
 
         takePressedAt = pressedAt
+        takeGeneration &+= 1
+        let generation = takeGeneration
         let keepSamplesInMemory = appState.activeProvider != .apple
         let capture = Task(priority: .userInitiated) {
             let coldStart = try await audioEngine.beginCapture(keepSamplesInMemory: keepSamplesInMemory)
@@ -195,6 +220,13 @@ final class EchoCoordinator {
                 collector: audioEngine.sampleCollector,
                 vocabularyHints: DictationSettings.shared.vocabulary
             )
+        }
+
+        // The stop shortcut's modifiers go down a beat before its key: start the tail then.
+        stopIntent.start(modifiers: appState.hotkeyModifiers) {
+            Task { @MainActor in
+                EchoCoordinator.shared.anticipateStop()
+            }
         }
 
         // Reading the previous clipboard can be slow when it holds an image or a file promise,
@@ -217,7 +249,8 @@ final class EchoCoordinator {
                 try await capture.value
                 try await startTask?.value
             } catch {
-                guard appState.phase == .recording else { return }
+                guard appState.phase == .recording, takeGeneration == generation else { return }
+                stopIntent.stop()
                 await audioEngine.endCapture()
                 await transcriptionService.cancel()
                 appState.errorMessage = error.localizedDescription
@@ -229,7 +262,13 @@ final class EchoCoordinator {
         }
     }
 
+    private func anticipateStop() {
+        guard appState.phase == .recording else { return }
+        transcriptionService.anticipateStop()
+    }
+
     private func stopRecording() {
+        stopIntent.stop()
         sceneTask?.cancel()
         appState.phase = .processing
         let provider = appState.activeProvider
@@ -243,19 +282,42 @@ final class EchoCoordinator {
             if let delay = audioEngine.firstBufferDelay(since: takePressedAt) {
                 Latency.firstBuffer(delay)
             }
-            let flush = Task(priority: .userInitiated) { await self.audioEngine.endCapture() }
+            let flush = Task(priority: .userInitiated) { () -> (AudioCaptureSnapshot, Double) in
+                let flushStart = CFAbsoluteTimeGetCurrent()
+                let snapshot = await self.audioEngine.endCapture()
+                return (snapshot, Latency.milliseconds(since: flushStart))
+            }
             do {
                 _ = try? await capture?.value
-                try await start?.value
-                let snapshot = await flush.value
-                let raw = try await transcriptionService.finishAndTranscribe(snapshot: snapshot)
+                // A cold Whisper / Parakeet can take tens of seconds to load. If its Apple shadow
+                // is ready first, paste that rather than wait.
+                let waitStart = CFAbsoluteTimeGetCurrent()
+                let route = await transcriptionService.stopRoute()
+                if route == .primary {
+                    try await start?.value
+                }
+                let waitEngineMs = Latency.milliseconds(since: waitStart)
+                let (snapshot, flushMs) = await flush.value
+                let decodeStart = CFAbsoluteTimeGetCurrent()
+                let raw = route == .fallback
+                    ? try await transcriptionService.finishWithFallback(snapshot: snapshot)
+                    : try await transcriptionService.finishAndTranscribe(snapshot: snapshot)
+                let decodeMs = Latency.milliseconds(since: decodeStart)
                 pendingRecognitionMs = Latency.milliseconds(since: stoppedAt)
                 pendingClipboard = await clipboardTask?.value ?? []
+                let servedByApple = provider == .apple || route == .fallback
                 Latency.recognition(
                     pendingRecognitionMs,
                     provider: provider.rawValue,
                     seconds: snapshot.seconds,
-                    streamed: provider == .apple && AppleSTTProvider.lastTakeWasStreamed
+                    streamed: servedByApple && AppleSTTProvider.lastTakeWasStreamed
+                )
+                Latency.stopBreakdown(
+                    flush: flushMs,
+                    waitEngine: waitEngineMs,
+                    decode: decodeMs,
+                    selected: provider.rawValue,
+                    served: route == .fallback ? "apple-fallback" : provider.rawValue
                 )
                 deliver(raw)
             } catch {
@@ -370,8 +432,12 @@ final class EchoCoordinator {
         case .apple:
             await AppleSTTProvider.prewarm()
         case .whisper:
+            // Apple first: it is small and quick, and it covers any take that starts before the
+            // large graph finishes loading.
+            await AppleSTTProvider.prewarmAsFallback()
             await WhisperKitProvider.prewarm(variant: whisperVariant)
         case .parakeet:
+            await AppleSTTProvider.prewarmAsFallback()
             await ParakeetProvider.prewarm(variant: parakeetVariant)
         case .deepgram, .mistral:
             break

@@ -85,14 +85,27 @@ nonisolated final class AudioGraph: @unchecked Sendable {
     func stop() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async {
-                self.stopLocked()
-                // A headset mic is only used when it is the sole input. Unregister it so
-                // nothing holds it between takes.
-                if self.device?.isBluetooth == true {
-                    self.releaseDeviceLocked()
-                }
+                self.stopDeviceLocked()
                 continuation.resume()
             }
+        }
+    }
+
+    /// Same as `stop`, without waiting. The graph queue is serial, so a following `start` still
+    /// runs after it; the take's audio is already out of the ring, so nobody needs to wait for
+    /// `AudioDeviceStop` before transcribing.
+    func stopInBackground() {
+        queue.async {
+            self.stopDeviceLocked()
+        }
+    }
+
+    private func stopDeviceLocked() {
+        stopLocked()
+        // A headset mic is only used when it is the sole input. Unregister it so
+        // nothing holds it between takes.
+        if device?.isBluetooth == true {
+            releaseDeviceLocked()
         }
     }
 
@@ -407,7 +420,8 @@ final class AudioEngineService {
         resetHistory()
         envelope = 0
         levelClock.reset()
-        await graph.stop()
+        // The snapshot is complete; stopping the hardware is not on the way to the transcript.
+        graph.stopInBackground()
         return snapshot
     }
 

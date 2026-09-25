@@ -52,6 +52,48 @@ nonisolated enum Latency: Sendable {
         )
     }
 
+    /// Where the time between stop and transcript went. `served` names the engine whose text was
+    /// pasted, which differs from the selected one when a cold engine was covered by Apple Speech.
+    static func stopBreakdown(flush: Double, waitEngine: Double, decode: Double, selected: String, served: String) {
+        log.notice(
+            """
+            stop breakdown flush=\(flush, format: .fixed(precision: 1))ms \
+            waitEngine=\(waitEngine, format: .fixed(precision: 1))ms \
+            decode=\(decode, format: .fixed(precision: 1))ms \
+            selected=\(selected, privacy: .public) served=\(served, privacy: .public)
+            """
+        )
+    }
+
+    /// What the streaming pipeline left for stop. `tail=0` with `hit=true` means stop ran no model.
+    static func streamingTail(
+        tailSeconds: Double,
+        speculativeHit: Bool,
+        reused: Bool,
+        cuts: Int,
+        forcedCuts: Int,
+        speculations: Int,
+        anticipated: Bool,
+        path: String
+    ) {
+        log.notice(
+            """
+            streaming tail=\(tailSeconds, format: .fixed(precision: 2))s \
+            speculativeHit=\(speculativeHit, privacy: .public) reused=\(reused, privacy: .public) \
+            cuts=\(cuts) forced=\(forcedCuts) speculations=\(speculations) \
+            anticipated=\(anticipated, privacy: .public) path=\(path, privacy: .public)
+            """
+        )
+    }
+
+    static func modelLoad(_ model: String, _ ms: Double) {
+        log.notice("model load \(model, privacy: .public) \(ms, format: .fixed(precision: 1))ms")
+    }
+
+    static func modelWarm(_ model: String, _ ms: Double) {
+        log.notice("model warmup \(model, privacy: .public) \(ms, format: .fixed(precision: 1))ms")
+    }
+
     static func launch(_ ms: Double) {
         log.notice("launch→hotkeyArmed \(ms, format: .fixed(precision: 1))ms")
     }

@@ -101,6 +101,14 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
         }
     }
 
+    /// Whether a take could start on this variant without loading it. A cold take gets an Apple
+    /// Speech shadow so stop never waits out the load.
+    static func isResident(variant: WhisperVariant) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cached?.variant == variant.rawValue
+    }
+
     static func prewarm(variant: WhisperVariant) async {
         guard let folder = LocalModelPresence.folder(for: .whisper(variant)) else { return }
         guard let loaded = try? await loadCached(variant: variant, folder: folder) else { return }
@@ -266,6 +274,7 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
         inflightGeneration &+= 1
         let generation = inflightGeneration
         let task = Task<CachedKit, Error> {
+            let loadStart = CFAbsoluteTimeGetCurrent()
             let downloadBase = LocalModelPaths.whisperDirectory()
             guard LocalModelPaths.whisperTokenizerPresent(
                 modelFolder: folder,
@@ -285,6 +294,7 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
                 download: false
             )
             let kit = try await WhisperKit(config)
+            Latency.modelLoad("whisper.\(variant.rawValue)", Latency.milliseconds(since: loadStart))
             return CachedKit(variant: variant.rawValue, kit: kit, folderPath: path)
         }
         inflight[key] = InflightLoad(generation: generation, task: task)
@@ -323,10 +333,13 @@ nonisolated final class WhisperKitProvider: TranscriptionProvider, BatchAudioCon
 
     private static func makeWarmTask(_ loaded: CachedKit) -> Task<Void, Never> {
         let kit = loaded.kit
+        let name = "whisper.\(loaded.variant)"
         return Task.detached(priority: .utility) {
+            let warmStart = CFAbsoluteTimeGetCurrent()
             let options = hotPathOptions(promptTokens: nil, sampleCount: 16_000)
             let warmup = [Float](repeating: 0.0001, count: 16_000)
             _ = try? await kit.transcribe(audioArray: warmup, decodeOptions: options)
+            Latency.modelWarm(name, Latency.milliseconds(since: warmStart))
         }
     }
 

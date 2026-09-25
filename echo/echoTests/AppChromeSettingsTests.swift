@@ -22,7 +22,7 @@ struct AppChromeSettingsTests {
         #expect(app.contains("MenuBarExtra(isInserted: $settings.showMenuBar)"))
         #expect(app.contains("setActivationPolicy"))
         #expect(app.contains("EchoMenuBarIcon.image"))
-        #expect(app.contains("MenuBarWaveform"))
+        #expect(app.contains("MenuBarIcon"))
     }
 
     @Test func chromeKeysMatchRestoreClipboardPersistence() throws {

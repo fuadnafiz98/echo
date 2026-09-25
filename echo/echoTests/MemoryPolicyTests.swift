@@ -80,7 +80,16 @@ struct MemoryPolicyTests {
         let schedule = try #require(AppSource.method(source, named: "scheduleIdleUnload"))
         #expect(schedule.contains("startMemoryPressureWatch()"))
         #expect(schedule.contains("phase != .idle"))
-        #expect(schedule.contains("evictLargeGraphs()"))
+        #expect(schedule.contains("evictForIdle()"))
+    }
+
+    /// Parakeet costs ~50 MB resident but a reload can mean a 30 s ANE recompile, so idle keeps it.
+    @Test func idleBackstopKeepsParakeetResident() throws {
+        let source = try AppSource.load("Services/Models/ResidentEnginePolicy.swift")
+        let idle = try #require(AppSource.method(source, named: "evictForIdle"))
+        #expect(idle.contains("WhisperKitProvider.evict()"))
+        #expect(!idle.contains("ParakeetProvider.evict()"))
+        #expect(!idle.contains("AppleSTTProvider.evict()"))
     }
 
     /// Apple's analyzer is tens of megabytes and reloading it is the single biggest source of a

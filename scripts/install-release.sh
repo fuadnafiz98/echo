@@ -11,7 +11,14 @@ derived="$root/.derivedData"
 product="$derived/Build/Products/Release/echo.app"
 target="$HOME/Applications/echo.app"
 
-echo "==> Building Release"
+# ECHO_STREAM_COMPARE=1 compiles in the streaming-vs-batch comparison (StreamingComparison.swift).
+extra=""
+if [ "${ECHO_STREAM_COMPARE:-0}" = 1 ]; then
+    extra='SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) ECHO_STREAM_COMPARE'
+    echo "==> Building Release with the stream comparison compiled in"
+else
+    echo "==> Building Release"
+fi
 xcodebuild \
     -project "$root/echo/echo.xcodeproj" \
     -scheme echo \
@@ -20,6 +27,7 @@ xcodebuild \
     -derivedDataPath "$derived" \
     -skipPackagePluginValidation \
     -skipMacroValidation \
+    ${extra:+"$extra"} \
     build
 
 test -d "$product" || { echo "Release product missing: $product" >&2; exit 1; }

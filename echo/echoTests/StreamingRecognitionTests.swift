@@ -132,15 +132,27 @@ struct StreamingRecognitionTests {
         )
     }
 
-    /// Whisper's model window is genuinely independent per 30 s, so cutting a take into windows
-    /// matches how it already works. Parakeet is not: FluidAudio resets the TDT decoder state for
-    /// every chunk and stitches them with overlapping context frames, so hand-cut windows with a
-    /// threaded state would be using the library against its own contract. It stays whole-take.
-    @Test func parakeetDeliberatelyDoesNotChunk() throws {
+    /// Parakeet streams through pause-aligned windows, each decoded with a *fresh* decoder state
+    /// the way FluidAudio's own chunks are, and falls back to the whole take on any failure.
+    @Test func parakeetStreamsWithFreshStateAndFallsBack() throws {
         let source = try AppSource.load("Services/Transcription/ParakeetProvider.swift")
-        #expect(!source.contains("AudioChunkPipeline"))
-        #expect(!source.contains("StreamingAudioConsumer"))
-        #expect(source.contains("resets the TDT decoder state"))
+        #expect(source.contains("StreamingAudioConsumer"))
+        #expect(source.contains("PauseWindowPipeline"))
+        let decode = try #require(AppSource.method(source, named: "decodeWindow"))
+        #expect(decode.contains("TdtDecoderState.make"), "every window starts from a fresh decoder")
+        #expect(decode.contains("tokenTimings"))
+        let start = try #require(AppSource.method(source, named: "startStreaming"))
+        #expect(
+            AppSource.appearsInOrder(start, ["PauseWindowPipeline", "loadCached"]),
+            "the pipeline must be listening before a cold load is awaited"
+        )
+        let stop = try #require(AppSource.method(source, named: "stopStreaming"))
+        #expect(
+            AppSource.appearsInOrder(stop, ["finishStreaming", "resolvedSamples()"]),
+            "the whole take is the fallback, read only if streaming could not finish"
+        )
+        let finish = try #require(AppSource.method(source, named: "finishStreaming"))
+        #expect(finish.contains("sawAtLeast(frames:"))
     }
 
     /// A tail too short for the recogniser must not throw away windows already transcribed.

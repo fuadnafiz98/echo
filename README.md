@@ -12,7 +12,7 @@ Requires macOS 26.3 (Tahoe). Apple Speech is on-device. Whisper, Parakeet, and S
 
 - **Apple Speech** — default
 - **Whisper** — WhisperKit (Tiny / Base / Small English, Large v3 Turbo)
-- **Parakeet** — FluidAudio TDT (English v2, multilingual v3)
+- **Parakeet** — FluidAudio TDT (English v2, multilingual v3), Streaming or Standard
 - **Deepgram / Mistral** — optional cloud, API key required
 
 Optional rewrite (Apple Intelligence or S1-mini) is off the paste path. Models download to `~/Library/Application Support/Echo/Models`.
@@ -57,3 +57,25 @@ you actually wait for. Stats in Settings shows the same two figures averaged.
 Apple Speech transcribes while you talk, so stop → paste does not grow with how long you spoke. If
 a take ever comes back wrong, `defaults write com.fuadnafiz98.echo echo.appleBatchFallback -bool YES`
 restores the old transcribe-after-stop behaviour.
+
+Parakeet has two pipelines, chosen in Settings → General when Parakeet is the engine:
+
+- **Streaming** (default) transcribes in windows cut at your pauses while you talk, and decodes the
+  tail each time you pause. Stopping after a pause pastes with no model work left, whatever the
+  length of the take. Stopping mid-word decodes only the last few seconds.
+- **Standard** transcribes the whole recording after you stop. The wait grows with the take.
+
+Every streaming take logs `streaming tail=… speculativeHit=… reused=…`; `speculativeHit=true` means
+stop ran no model. `stop breakdown` splits each stop into capture flush, waiting for the engine and
+decode, and names the engine that was used. If Parakeet is still loading when a take starts, Apple
+Speech listens alongside it and covers the take (`served=apple-fallback`).
+
+To measure Parakeet on this Mac (stop cost, word error rate against a known script, memory), run
+the benchmark suite in Release:
+
+```sh
+TEST_RUNNER_ECHO_PARAKEET_BENCH=1 TEST_RUNNER_ECHO_BENCH_OUT=/tmp/echo-bench \
+xcodebuild test -scheme echo -configuration Release ENABLE_TESTABILITY=YES \
+  -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation \
+  -only-testing:echoTests/ParakeetBenchmarkTests
+```

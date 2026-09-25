@@ -167,18 +167,24 @@ private struct EchoMenuBarScene: Scene {
             )
         } label: {
             Image(nsImage: EchoMenuBarIcon.image)
-                .renderingMode(.template)
+                .renderingMode(.original)
                 .accessibilityLabel("Echo")
         }
     }
 }
 
+/// Shaded miniature of the app icon. Not a template: keeps its own tones
+/// so the grille and stand detail survive at menu bar size.
 enum EchoMenuBarIcon {
+    static let height: CGFloat = 18
+
     static var image: NSImage {
-        let named = NSImage(named: "MenuBarWaveform") ?? NSImage()
+        let named = NSImage(named: "MenuBarIcon") ?? NSImage()
         let icon = named.copy() as? NSImage ?? named
-        icon.isTemplate = true
-        icon.size = NSSize(width: 18, height: 18)
+        icon.isTemplate = false
+        if icon.size.height > 0 {
+            icon.size = NSSize(width: icon.size.width * height / icon.size.height, height: height)
+        }
         return icon
     }
 }

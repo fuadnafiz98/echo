@@ -399,6 +399,33 @@ nonisolated final class AppleSTTProvider: TranscriptionProvider, BatchAudioConsu
         }
     }
 
+    // MARK: - Fallback for a cold local engine
+
+    /// Whether Apple Speech can cover a take without asking for anything: Speech access already
+    /// granted and the on-device model already installed. A shadow must never raise a permission
+    /// prompt or start a download in the middle of someone else's take.
+    static func canServeAsFallback() async -> Bool {
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized else { return false }
+        cacheLock.lock()
+        let ready = assetsReady
+        cacheLock.unlock()
+        if ready { return true }
+        guard let locale = await resolvedLocale() else { return false }
+        let probe = SpeechTranscriber(locale: locale, preset: .transcription)
+        guard await AssetInventory.status(forModules: [probe]) == .installed else { return false }
+        cacheLock.lock()
+        assetsReady = true
+        cacheLock.unlock()
+        return true
+    }
+
+    /// Keeps a warm analyzer pair ready behind Whisper or Parakeet, so a take that starts while
+    /// the large graph is cold is covered from its first word. Tens of megabytes.
+    static func prewarmAsFallback() async {
+        guard await canServeAsFallback() else { return }
+        await prewarm()
+    }
+
     static func prewarm() async {
         let task: Task<Void, Never>
         let generation: UInt64

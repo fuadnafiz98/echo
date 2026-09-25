@@ -106,6 +106,39 @@ nonisolated enum ParakeetVariant: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// How Parakeet turns a take into text. Chosen in Settings → Models.
+nonisolated enum TranscriptionPipeline: String, CaseIterable, Identifiable, Sendable {
+    /// The whole take is decoded after stop. Cost grows with the length of the take.
+    case standard
+    /// Pause-aligned windows are decoded while the user talks, and the tail is decoded at each
+    /// pause, so stop usually has nothing left to do.
+    case streaming
+
+    static let defaultsKey = "transcriptionPipeline"
+    static let fallback: TranscriptionPipeline = .streaming
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .standard: "Standard"
+        case .streaming: "Streaming"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .standard: "Transcribes the whole recording after you stop. The wait grows with how long you talked."
+        case .streaming: "Transcribes while you talk, so text appears almost as soon as you stop, however long the take."
+        }
+    }
+
+    /// Read on the take path, so it must stay a plain defaults lookup.
+    static var current: TranscriptionPipeline {
+        UserDefaults.standard.string(forKey: defaultsKey).flatMap(Self.init(rawValue:)) ?? fallback
+    }
+}
+
 nonisolated enum LocalModelID: Hashable, Identifiable, Sendable {
     case whisper(WhisperVariant)
     case parakeet(ParakeetVariant)

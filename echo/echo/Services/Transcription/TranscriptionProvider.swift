@@ -22,7 +22,18 @@ nonisolated protocol LiveAudioConsumer: AnyObject, Sendable {
 /// one is freshly allocated, so the consumer may hold it. This is deliberately not
 /// ``LiveAudioConsumer``: that one fires on the CoreAudio tap with a reused buffer.
 nonisolated protocol StreamingAudioConsumer: AnyObject, Sendable {
+    /// False when this take will not use live audio, so the collector need not copy it out.
+    var wantsStreamingBuffers: Bool { get }
     func consumeStreamingBuffer(_ buffer: AVAudioPCMBuffer)
+}
+
+extension StreamingAudioConsumer {
+    var wantsStreamingBuffers: Bool { true }
+}
+
+/// A provider that can use a moment's warning that stop is coming.
+nonisolated protocol StopAnticipating: AnyObject, Sendable {
+    func anticipateStop()
 }
 
 nonisolated protocol BatchAudioConsumer: AnyObject, Sendable {

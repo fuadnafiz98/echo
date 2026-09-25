@@ -64,6 +64,7 @@ private struct EchoAppIconHeader: View {
 private struct GeneralSettingsPane: View {
     @Bindable var appState: AppState
     @Bindable private var settings = DictationSettings.shared
+    @AppStorage(TranscriptionPipeline.defaultsKey) private var pipeline = TranscriptionPipeline.fallback
 
     var body: some View {
         Form {
@@ -99,6 +100,15 @@ private struct GeneralSettingsPane: View {
                 .pickerStyle(.menu)
                 .id(appState.selectableProviders().map(\.id))
 
+                if appState.activeProvider == .parakeet {
+                    Picker("Transcription", selection: $pipeline) {
+                        ForEach(TranscriptionPipeline.allCases) { option in
+                            Text(option.displayName).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
                 if let error = appState.errorMessage {
                     Text(error)
                         .foregroundStyle(.red)
@@ -107,7 +117,7 @@ private struct GeneralSettingsPane: View {
             } header: {
                 Text("Engine")
             } footer: {
-                Text(appState.activeProvider.subtitle)
+                Text(engineFooter)
                     .settingsFooter()
             }
 
@@ -166,6 +176,11 @@ private struct GeneralSettingsPane: View {
             }
         }
         .echoSettingsForm()
+    }
+
+    private var engineFooter: String {
+        guard appState.activeProvider == .parakeet else { return appState.activeProvider.subtitle }
+        return "\(appState.activeProvider.subtitle) \(pipeline.detail)"
     }
 
     private var chromeFooter: String {
